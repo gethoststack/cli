@@ -1,0 +1,53 @@
+{
+	"name": "@hoststack.dev/cli",
+	"version": "0.1.0",
+	"description": "Official command-line interface for HostStack — deploy and manage web services, databases, cron jobs, and domains on European infrastructure. See https://hoststack.dev",
+	"keywords": [
+		"hoststack",
+		"paas",
+		"deploy",
+		"hosting",
+		"europe",
+		"hetzner",
+		"render",
+		"cli",
+		"command-line",
+		"devops"
+	],
+	"homepage": "https://hoststack.dev/docs/cli",
+	"bugs": {
+		"url": "https://github.com/gethoststack/cli/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gethoststack/cli.git"
+	},
+	"license": "MIT",
+	"author": "HostStack Contributors (https://hoststack.dev)",
+	"type": "module",
+	"bin": {
+		"hoststack": "./dist/index.js"
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"engines": {
+		"node": ">=18"
+	},
+	"scripts": {
+		"build": "tsup",
+		"prepublishOnly": "bun run build",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.2.15",
+		"tsup": "^8.3.5",
+		"typescript": "^5.8.3"
+	}
+}
