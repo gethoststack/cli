@@ -1,15 +1,14 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeAll, describe, expect, test } from 'bun:test';
 
-import {
-	bold,
-	cyan,
-	dim,
-	green,
-	red,
-	statusBadge,
-	table,
-	yellow,
-} from '../lib/output.ts';
+import { bold, cyan, dim, green, red, statusBadge, table, yellow } from '../lib/output.ts';
+
+// The test runner's stdout is not a TTY, and color is now suppressed off-TTY
+// (so ANSI never leaks into pipes / files). Force color on to exercise the
+// wrapping logic deterministically — this is the same `FORCE_COLOR=1` escape
+// hatch real users get when piping to a color-aware pager.
+beforeAll(() => {
+	process.env.FORCE_COLOR = '1';
+});
 
 describe('ANSI color helpers', () => {
 	test.each([
@@ -29,10 +28,13 @@ describe('ANSI color helpers', () => {
 
 describe('table formatter', () => {
 	test('renders headers + rows with column padding', () => {
-		const out = table(['Name', 'Status'], [
-			['web', 'running'],
-			['worker', 'stopped'],
-		]);
+		const out = table(
+			['Name', 'Status'],
+			[
+				['web', 'running'],
+				['worker', 'stopped'],
+			],
+		);
 		const lines = out.split('\n');
 		expect(lines).toHaveLength(4); // headers + separator + 2 rows
 		expect(lines[0]).toContain('Name');

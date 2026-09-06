@@ -1,6 +1,7 @@
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
 import { bold, dim, green, handleError, red, spinner, statusBadge, table } from '../lib/output.ts';
+import { resolveServiceId } from '../lib/resolve.ts';
 
 interface Domain {
 	id: number;
@@ -88,18 +89,26 @@ async function addDomain(args: string[]): Promise<void> {
 	const domainIdx = args.indexOf('--domain');
 	const domain = domainIdx !== -1 ? args[domainIdx + 1] : args[0];
 	const serviceIdx = args.indexOf('--service');
-	const serviceId = serviceIdx !== -1 ? args[serviceIdx + 1] : undefined;
+	const serviceRaw = serviceIdx !== -1 ? args[serviceIdx + 1] : undefined;
+	const pathIdx = args.indexOf('--path-prefix');
+	const pathPrefix = pathIdx !== -1 ? args[pathIdx + 1] : undefined;
 
-	if (!domain) {
-		console.log(`${bold('Usage:')} hoststack domains add <domain> [--service <service-id>]`);
+	if (!domain || !serviceRaw) {
+		console.log(
+			`${bold('Usage:')} hoststack domains add <domain> --service <service-id|svc_…> [--path-prefix <prefix>]`,
+		);
+		console.log();
+		console.log(dim('  --service is required: every custom domain must point at a service.'));
 		process.exit(1);
 	}
+
+	const serviceId = await resolveServiceId(teamId, serviceRaw);
 
 	const s = spinner('Adding domain...');
 
 	try {
-		const body: Record<string, unknown> = { domain };
-		if (serviceId) body.serviceId = serviceId;
+		const body: Record<string, unknown> = { domain, serviceId };
+		if (pathPrefix) body.pathPrefix = pathPrefix;
 
 		const result = await apiFetch<{ domain: Domain }>(`/api/domains/${teamId}`, {
 			method: 'POST',

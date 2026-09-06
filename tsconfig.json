@@ -6,7 +6,13 @@
 		"allowImportingTsExtensions": true,
 		"strict": true,
 		"skipLibCheck": true,
-		"noEmit": true
+		"noEmit": true,
+		"noUncheckedIndexedAccess": true,
+		"noImplicitReturns": true,
+		"types": ["node", "bun"],
+		// tsup 8.5 injects `baseUrl: "."` into its dts worker; TS 6 deprecated
+		// baseUrl. Silence the warning until tsup ships a fix.
+		"ignoreDeprecations": "6.0"
 	},
 	"include": ["src/**/*.ts"]
 }

@@ -1,18 +1,30 @@
 import { cronCommand } from './commands/cron.ts';
+import { analyticsCommand } from './commands/analytics.ts';
+import { errorsCommand } from './commands/errors.ts';
 import { dbCommand } from './commands/db.ts';
 import { deployCommand } from './commands/deploy.ts';
+import { devCommand } from './commands/dev.ts';
 import { domainsCommand } from './commands/domains.ts';
 import { envCommand } from './commands/env.ts';
+import { environmentsCommand } from './commands/environments.ts';
+import { githubCommand } from './commands/github.ts';
 import { initCommand } from './commands/init.ts';
 import { loginCommand } from './commands/login.ts';
+import { machinesCommand } from './commands/machines.ts';
 import { logsCommand } from './commands/logs.ts';
 import { projectsCommand } from './commands/projects.ts';
 import { servicesCommand } from './commands/services.ts';
+import { uptimeCommand } from './commands/uptime.ts';
 import { validateCommand } from './commands/validate.ts';
+import { taskCommand } from './commands/task.ts';
+import { volumesCommand } from './commands/volumes.ts';
 import { whoamiCommand } from './commands/whoami.ts';
 import { bold, cyan, dim } from './lib/output.ts';
+import { CLI_VERSION } from './lib/version.ts';
 
-const VERSION = '0.1.0';
+// Injected from package.json at build time (see tsup.config.ts `define`) — no
+// hand-maintained constant to drift from the published version.
+const VERSION = CLI_VERSION;
 
 function printHelp(): void {
 	console.log(`
@@ -30,12 +42,20 @@ ${bold('RESOURCES')}
   ${cyan('services')}    Manage services (web, worker, cron)
   ${cyan('domains')}     Manage custom domains
   ${cyan('db')}          Manage databases (Postgres, Redis)
-  ${cyan('env')}         Manage environment variables
+  ${cyan('volumes')}     Manage persistent disks
+  ${cyan('env')}         Manage environment variables (per service)
+  ${cyan('environments')} Manage environments (production/staging/dev) per project
   ${cyan('cron')}        Manage cron job executions
+  ${cyan('dev')}         Spin up an AI dev environment (cloud terminal + agents)
+  ${cyan('task')}        Queue work for a dev box (the agent task backlog)
+  ${cyan('machines')}    Your own hardware, enrolled to run services and dev boxes
 
 ${bold('OPERATIONS')}
   ${cyan('deploy')}      Trigger and manage deployments
   ${cyan('logs')}        View runtime logs for a service
+  ${cyan('errors')}      Exceptions your apps reported, grouped by cause
+  ${cyan('uptime')}      Watch a service's public URL and alert when it stops answering
+  ${cyan('analytics')}   Cookieless traffic for every site you own, hosted here or not
 
 ${bold('INFRASTRUCTURE AS CODE')}
   ${cyan('init')}        Generate a starter hoststack.yaml
@@ -51,8 +71,18 @@ ${bold('EXAMPLES')}
   hoststack services list
   hoststack deploy trigger <service-id>
   hoststack logs <service-id>
-  hoststack env set <service-id> DATABASE_URL=postgres://...
+  hoststack db create --project prj_abc --name app-db --engine postgres
+  hoststack db link db_abc --service svc_xyz     ${dim('# injects DATABASE_URL')}
   hoststack db connect <database-id>
+  hoststack dev create --project prj_abc
+  hoststack machines list
+  hoststack errors list --service 48
+  hoststack errors fix 12                        ${dim('# hand it to an agent in the dev box')}
+  hoststack task add --project prj_abc --box svc_xyz "Fix the footprint join"
+  hoststack uptime set 48 --path /healthz --every 60
+  hoststack analytics stats --range 30d          ${dim('# every site, one table')}
+  hoststack machines add desktop                 ${dim('# prints the installer to run on it')}
+  hoststack services create --name api --type web --project prj_abc --machine desktop
   hoststack init
   hoststack validate
 
@@ -94,6 +124,11 @@ async function main(): Promise<void> {
 		case 'env':
 			await envCommand(args);
 			break;
+		case 'environments':
+		case 'environment':
+		case 'envs':
+			await environmentsCommand(args);
+			break;
 		case 'db':
 		case 'database':
 		case 'databases':
@@ -103,8 +138,38 @@ async function main(): Promise<void> {
 		case 'domain':
 			await domainsCommand(args);
 			break;
+		case 'volumes':
+		case 'volume':
+		case 'disks':
+		case 'disk':
+			await volumesCommand(args);
+			break;
 		case 'cron':
 			await cronCommand(args);
+			break;
+		case 'task':
+		case 'tasks':
+			await taskCommand(args);
+			break;
+		case 'errors':
+		case 'error':
+			await errorsCommand(args);
+			break;
+		case 'analytics':
+			await analyticsCommand(args);
+			break;
+		case 'uptime':
+			await uptimeCommand(args);
+			break;
+		case 'github':
+			await githubCommand(args);
+			break;
+		case 'dev':
+			await devCommand(args);
+			break;
+		case 'machines':
+		case 'machine':
+			await machinesCommand(args);
 			break;
 		case 'init':
 			await initCommand(args);

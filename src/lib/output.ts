@@ -1,10 +1,40 @@
+// --- Color & TTY detection ---
+//
+// Suppress ANSI escapes when:
+//   - the user set NO_COLOR (https://no-color.org)
+//   - the user set FORCE_COLOR=0
+//   - stdout is not a TTY (piped to a file or CI log capture)
+// Force enable when FORCE_COLOR=1 or FORCE_COLOR=true.
+//
+// Evaluated per-call (cheap) so tests / scripts can override the env late
+// and the next call respects it.
+function colorEnabled(): boolean {
+	const force = process.env.FORCE_COLOR;
+	if (force === '0' || force === 'false') return false;
+	if (force === '1' || force === 'true') return true;
+	if (process.env.NO_COLOR) return false;
+	if (process.env.NODE_DISABLE_COLORS) return false;
+	// Suppress color when stdout is not a TTY (piped to a file, captured by CI,
+	// or consumed by another program) unless color was force-enabled above.
+	// Emitting raw ANSI into a pipe corrupts `| grep`, `> file`, and `--json`
+	// consumers. A real terminal (isTTY === true) keeps color on by default.
+	if (process.stdout.isTTY !== true && force === undefined) {
+		return false;
+	}
+	return true;
+}
+
+function wrap(open: string, close: string): (s: string) => string {
+	return (s: string) => (colorEnabled() ? `\x1b[${open}m${s}\x1b[${close}m` : s);
+}
+
 // --- ANSI color helpers ---
-export const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
-export const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
-export const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
-export const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
-export const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
-export const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
+export const bold = wrap('1', '0');
+export const dim = wrap('2', '0');
+export const green = wrap('32', '0');
+export const red = wrap('31', '0');
+export const yellow = wrap('33', '0');
+export const cyan = wrap('36', '0');
 
 // --- Table formatter ---
 export function table(headers: string[], rows: string[][]): string {
@@ -51,7 +81,18 @@ export function statusBadge(status: string): string {
 }
 
 // --- Spinner ---
+// Animates only when stdout is a TTY. Non-interactive callers (CI, scripts)
+// get a single-line "Running…" → "Done" pair, keeping piped logs clean.
 export function spinner(message: string): { stop: (finalMessage?: string) => void } {
+	if (!process.stdout.isTTY) {
+		process.stdout.write(`${message}\n`);
+		return {
+			stop(finalMessage?: string) {
+				if (finalMessage) process.stdout.write(`${finalMessage}\n`);
+			},
+		};
+	}
+
 	const frames = ['|', '/', '-', '\\'];
 	let i = 0;
 
@@ -63,7 +104,9 @@ export function spinner(message: string): { stop: (finalMessage?: string) => voi
 	return {
 		stop(finalMessage?: string) {
 			clearInterval(interval);
-			process.stdout.write(`\r${green('+')} ${finalMessage ?? message}\n`);
+			// Clear the line then write the final state. CSI 2K erases the entire
+			// spinner row so a shorter final message doesn't leave trailing frames.
+			process.stdout.write(`\r\x1b[2K${green('+')} ${finalMessage ?? message}\n`);
 		},
 	};
 }

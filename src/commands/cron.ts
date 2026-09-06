@@ -80,7 +80,9 @@ async function listExecutions(args: string[]): Promise<void> {
 				executions.map((e) => [
 					e.publicId,
 					statusBadge(e.status),
-					e.exitCode !== null && e.exitCode !== undefined ? String(e.exitCode) : dim('n/a'),
+					e.exitCode !== null && e.exitCode !== undefined
+						? String(e.exitCode)
+						: dim('n/a'),
 					e.startedAt ? new Date(e.startedAt).toLocaleString() : dim('n/a'),
 					e.finishedAt ? new Date(e.finishedAt).toLocaleString() : dim('n/a'),
 				]),
@@ -126,8 +128,12 @@ async function getExecution(args: string[]): Promise<void> {
 		if (e.triggeredBy) {
 			console.log(`${bold('Triggered:')}   ${e.triggeredBy}`);
 		}
-		console.log(`${bold('Started:')}     ${e.startedAt ? new Date(e.startedAt).toLocaleString() : dim('n/a')}`);
-		console.log(`${bold('Finished:')}    ${e.finishedAt ? new Date(e.finishedAt).toLocaleString() : dim('n/a')}`);
+		console.log(
+			`${bold('Started:')}     ${e.startedAt ? new Date(e.startedAt).toLocaleString() : dim('n/a')}`,
+		);
+		console.log(
+			`${bold('Finished:')}    ${e.finishedAt ? new Date(e.finishedAt).toLocaleString() : dim('n/a')}`,
+		);
 		console.log(`${bold('Created:')}     ${new Date(e.createdAt).toLocaleString()}`);
 	} catch (err) {
 		handleError(err);
@@ -155,7 +161,9 @@ async function triggerExecution(args: string[]): Promise<void> {
 			{ method: 'POST' },
 		);
 		s.stop('Cron execution triggered');
-		console.log(`${green('+')} Execution ${bold(result.execution.publicId)} ${dim(`(${result.execution.status})`)}`);
+		console.log(
+			`${green('+')} Execution ${bold(result.execution.publicId)} ${dim(`(${result.execution.status})`)}`,
+		);
 	} catch (err) {
 		s.stop(red('Failed'));
 		handleError(err);
