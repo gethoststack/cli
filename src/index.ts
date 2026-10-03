@@ -1,18 +1,23 @@
+import { activityCommand } from './commands/activity.ts';
+import { alertsCommand } from './commands/alerts.ts';
 import { cronCommand } from './commands/cron.ts';
 import { analyticsCommand } from './commands/analytics.ts';
 import { errorsCommand } from './commands/errors.ts';
 import { dbCommand } from './commands/db.ts';
 import { deployCommand } from './commands/deploy.ts';
 import { devCommand } from './commands/dev.ts';
+import { dnsCommand } from './commands/dns.ts';
 import { domainsCommand } from './commands/domains.ts';
 import { envCommand } from './commands/env.ts';
 import { environmentsCommand } from './commands/environments.ts';
 import { githubCommand } from './commands/github.ts';
+import { infraCommand } from './commands/infra.ts';
 import { initCommand } from './commands/init.ts';
 import { loginCommand } from './commands/login.ts';
 import { machinesCommand } from './commands/machines.ts';
 import { logsCommand } from './commands/logs.ts';
 import { projectsCommand } from './commands/projects.ts';
+import { reportCommand } from './commands/report.ts';
 import { servicesCommand } from './commands/services.ts';
 import { uptimeCommand } from './commands/uptime.ts';
 import { validateCommand } from './commands/validate.ts';
@@ -41,6 +46,7 @@ ${bold('RESOURCES')}
   ${cyan('projects')}    Manage projects
   ${cyan('services')}    Manage services (web, worker, cron)
   ${cyan('domains')}     Manage custom domains
+  ${cyan('dns')}         Authoritative DNS — zones, records, and who the registry points at
   ${cyan('db')}          Manage databases (Postgres, Redis)
   ${cyan('volumes')}     Manage persistent disks
   ${cyan('env')}         Manage environment variables (per service)
@@ -49,13 +55,17 @@ ${bold('RESOURCES')}
   ${cyan('dev')}         Spin up an AI dev environment (cloud terminal + agents)
   ${cyan('task')}        Queue work for a dev box (the agent task backlog)
   ${cyan('machines')}    Your own hardware, enrolled to run services and dev boxes
+  ${cyan('infra')}       An infrastructure machine's cutover, run with an infra operator token
 
 ${bold('OPERATIONS')}
   ${cyan('deploy')}      Trigger and manage deployments
   ${cyan('logs')}        View runtime logs for a service
   ${cyan('errors')}      Exceptions your apps reported, grouped by cause
+  ${cyan('alerts')}      What is on fire, and where the team is told about it
+  ${cyan('activity')}    The audit log: who changed what, and when
   ${cyan('uptime')}      Watch a service's public URL and alert when it stops answering
   ${cyan('analytics')}   Cookieless traffic for every site you own, hosted here or not
+  ${cyan('report')}      File a platform fault with the HostStack team
 
 ${bold('INFRASTRUCTURE AS CODE')}
   ${cyan('init')}        Generate a starter hoststack.yaml
@@ -74,15 +84,26 @@ ${bold('EXAMPLES')}
   hoststack db create --project prj_abc --name app-db --engine postgres
   hoststack db link db_abc --service svc_xyz     ${dim('# injects DATABASE_URL')}
   hoststack db connect <database-id>
+  hoststack dns zones                            ${dim('# and whether the registry points here')}
+  hoststack dns check example.com
+  hoststack dns add example.com A www 203.0.113.10 --ttl 300
   hoststack dev create --project prj_abc
   hoststack machines list
   hoststack errors list --service 48
   hoststack errors fix 12                        ${dim('# hand it to an agent in the dev box')}
+  hoststack alerts --since -6h                   ${dim('# what broke this afternoon')}
+  hoststack alerts channels add --type slack --name ops --url https://... --events all
+  hoststack activity --type deploy --since -2h
+  hoststack services metrics svc_xyz             ${dim('# and the host it sits on')}
+  hoststack deploy diagnose svc_xyz dpl_abc      ${dim('# record + build log + runtime log')}
+  hoststack deploy promote svc_stg dpl_abc --to env_prod
+  hoststack db query db_abc "SELECT count(*) FROM users"
   hoststack task add --project prj_abc --box svc_xyz "Fix the footprint join"
   hoststack uptime set 48 --path /healthz --every 60
   hoststack analytics stats --range 30d          ${dim('# every site, one table')}
   hoststack machines add desktop                 ${dim('# prints the installer to run on it')}
   hoststack services create --name api --type web --project prj_abc --machine desktop
+  hoststack infra release plan 15 --commit <sha>  ${dim('# needs HOSTSTACK_INFRA_OPERATOR_TOKEN')}
   hoststack init
   hoststack validate
 
@@ -90,6 +111,7 @@ ${bold('ENVIRONMENT')}
   HOSTSTACK_API_KEY     API key (overrides config file)
   HOSTSTACK_API_URL     API base URL (overrides config file)
   HOSTSTACK_TEAM_ID     Team ID (overrides config file)
+  HOSTSTACK_INFRA_OPERATOR_TOKEN  Token for ${cyan('hoststack infra')} (never saved to the config file)
 
 ${dim(`Config: ~/.hoststack/config.json`)}
 `);
@@ -138,6 +160,9 @@ async function main(): Promise<void> {
 		case 'domain':
 			await domainsCommand(args);
 			break;
+		case 'dns':
+			await dnsCommand(args);
+			break;
 		case 'volumes':
 		case 'volume':
 		case 'disks':
@@ -155,6 +180,17 @@ async function main(): Promise<void> {
 		case 'error':
 			await errorsCommand(args);
 			break;
+		case 'alerts':
+		case 'alert':
+			await alertsCommand(args);
+			break;
+		case 'activity':
+		case 'audit':
+			await activityCommand(args);
+			break;
+		case 'report':
+			await reportCommand(args);
+			break;
 		case 'analytics':
 			await analyticsCommand(args);
 			break;
@@ -170,6 +206,9 @@ async function main(): Promise<void> {
 		case 'machines':
 		case 'machine':
 			await machinesCommand(args);
+			break;
+		case 'infra':
+			await infraCommand(args);
 			break;
 		case 'init':
 			await initCommand(args);

@@ -1,5 +1,6 @@
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
+import { formatCount, formatDateTime } from '../lib/format.ts';
 import { bold, cyan, dim, green, handleError, red, table, yellow } from '../lib/output.ts';
 
 interface ErrorIssue {
@@ -148,7 +149,7 @@ async function listIssues(args: string[]): Promise<void> {
 					String(issue.id),
 					issue.title.length > 60 ? `${issue.title.slice(0, 57)}…` : issue.title,
 					issue.culprit ?? dim('—'),
-					issue.occurrenceCount.toLocaleString('en-GB'),
+					formatCount(issue.occurrenceCount),
 					issue.affectedUsers >= 500 ? '500+' : String(issue.affectedUsers),
 					relative(issue.lastSeenAt),
 				]),
@@ -189,7 +190,7 @@ async function showIssue(args: string[]): Promise<void> {
 			`${dim('Service')}   ${issue.serviceName ?? issue.serviceId}    ${dim('Status')}  ${issue.status}    ${dim('Level')}  ${issue.level}`,
 		);
 		console.log(
-			`${dim('Events')}    ${issue.occurrenceCount.toLocaleString('en-GB')}    ${dim('Users')}  ${
+			`${dim('Events')}    ${formatCount(issue.occurrenceCount)}    ${dim('Users')}  ${
 				issue.affectedUsers >= 500 ? '500+' : issue.affectedUsers
 			}`,
 		);
@@ -203,7 +204,7 @@ async function showIssue(args: string[]): Promise<void> {
 		if (issue.droppedCount > 0) {
 			console.log(
 				yellow(
-					`${issue.droppedCount.toLocaleString('en-GB')} occurrence(s) counted but not stored — this service went over its hourly ingest quota. The count above is still accurate.`,
+					`${formatCount(issue.droppedCount)} occurrence(s) counted but not stored — this service went over its hourly ingest quota. The count above is still accurate.`,
 				),
 			);
 		}
@@ -215,7 +216,7 @@ async function showIssue(args: string[]): Promise<void> {
 			console.log();
 			console.log(
 				dim(
-					`── ${new Date(occurrence.createdAt).toLocaleString()}${occurrence.requestId ? ` · request ${occurrence.requestId}` : ''}${occurrence.release ? ` · ${occurrence.release.slice(0, 7)}` : ''}`,
+					`── ${formatDateTime(occurrence.createdAt)}${occurrence.requestId ? ` · request ${occurrence.requestId}` : ''}${occurrence.release ? ` · ${occurrence.release.slice(0, 7)}` : ''}`,
 				),
 			);
 			if (occurrence.stack) console.log(occurrence.stack);

@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process';
+import { text as readStream } from 'node:stream/consumers';
 
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
+import { formatDate, formatDateTime } from '../lib/format.ts';
 import { resolveProjectId } from '../lib/resolve.ts';
 import { machineIdFromFlag } from './machines.ts';
 import {
@@ -14,6 +16,7 @@ import {
 	spinner,
 	statusBadge,
 	table,
+	yellow,
 } from '../lib/output.ts';
 
 interface Database {
@@ -35,7 +38,15 @@ interface DatabaseCredentials {
 	port: number;
 	username: string;
 	password: string;
-	database: string;
+	// `databaseName`, as the API and the SDK both spell it. This was `database`,
+	// which no response has ever carried, so `hoststack db credentials` printed
+	// "Database: undefined" beside a connection URL holding the right name —
+	// and the parts are exactly what you reach for when a client wants them
+	// rather than the URL (task 442). The cosmetic half is what was reported;
+	// the same field also builds `db connect`'s argv, so `psql -d undefined`,
+	// `mysql undefined` and `mongodb://host:port/undefined` were what that
+	// command has been running for postgres, mysql/mariadb and mongodb.
+	databaseName: string;
 	connectionUrl: string;
 	// Render-style external connectivity — present when external access is
 	// enabled. The internal fields above stay the in-cluster endpoint; these
@@ -87,10 +98,22 @@ export async function dbCommand(args: string[]): Promise<void> {
 			return suspendDatabase(args.slice(1));
 		case 'resume':
 			return resumeDatabase(args.slice(1));
+		case 'restart':
+			return restartDatabase(args.slice(1));
+		case 'update':
+		case 'edit':
+			return updateDatabase(args.slice(1));
+		case 'query':
+		case 'sql':
+			return queryDatabase(args.slice(1));
+		case 'upgrade-version':
+			return upgradeVersion(args.slice(1));
 		case 'upgrade-to-ha':
 			return upgradeToHa(args.slice(1));
 		case 'cluster':
 			return clusterInfo(args.slice(1));
+		case 'backups':
+			return listRestorePoints(args.slice(1));
 		default:
 			console.log(`${bold('Usage:')} hoststack db <command>`);
 			console.log();
@@ -103,9 +126,12 @@ export async function dbCommand(args: string[]): Promise<void> {
 			console.log(
 				'  external <id> --enable|--disable [--allow <cidr> ...]  Toggle external (public) access',
 			);
+			console.log('  update <id> [--name <n>] [--plan <p>] [--disk <gb>]   Rename / resize');
+			console.log('  query <id> "<sql>"        One READ-ONLY statement (Postgres)');
 			console.log('  delete <id>               Delete a database');
 			console.log('  suspend <id>              Stop the container, keep the data');
 			console.log('  resume <id>               Restart a suspended database');
+			console.log('  restart <id>              Bounce the container in place');
 			console.log();
 			console.log('Connecting a database to an app:');
 			console.log(
@@ -117,8 +143,15 @@ export async function dbCommand(args: string[]): Promise<void> {
 				dim('  A link takes effect on the NEXT deploy: hoststack deploy trigger <svc-id>'),
 			);
 			console.log();
+			console.log('  upgrade-version <id> --to <v>   In-place engine major upgrade');
 			console.log('  upgrade-to-ha <id>        Migrate a standalone Postgres to HA');
 			console.log('  cluster <id>              Show HA cluster topology + failovers');
+			console.log();
+			console.log('  backups <id>              Off-site archives you could restore from');
+			console.log(
+				dim('  A nightly schedule is a promise; this is the evidence. Check it for'),
+			);
+			console.log(dim('  anything whose loss is not survivable.'));
 			process.exit(1);
 	}
 }
@@ -163,7 +196,7 @@ async function listDatabases(args: string[]): Promise<void> {
 					d.name,
 					d.engine ?? d.type ?? '',
 					statusBadge(d.status),
-					new Date(d.createdAt).toLocaleDateString(),
+					formatDate(d.createdAt),
 				]),
 			),
 		);
@@ -194,7 +227,7 @@ async function getDatabase(args: string[]): Promise<void> {
 		console.log(`${bold('Engine:')}  ${d.engine ?? d.type ?? ''}`);
 		console.log(`${bold('Status:')}  ${statusBadge(d.status)}`);
 		if (d.version) console.log(`${bold('Version:')} ${d.version}`);
-		console.log(`${bold('Created:')} ${new Date(d.createdAt).toLocaleString()}`);
+		console.log(`${bold('Created:')} ${formatDateTime(d.createdAt)}`);
 	} catch (err) {
 		handleError(err);
 	}
@@ -291,7 +324,7 @@ async function getCredentials(args: string[]): Promise<void> {
 		console.log(`${bold('Port:')}     ${c.port}`);
 		console.log(`${bold('User:')}     ${c.username}`);
 		console.log(`${bold('Password:')} ${c.password}`);
-		console.log(`${bold('Database:')} ${c.database}`);
+		console.log(`${bold('Database:')} ${c.databaseName}`);
 		console.log();
 		console.log(`${bold('Connection URL (internal):')}`);
 		console.log(cyan(c.connectionUrl));
@@ -364,20 +397,20 @@ async function connectDatabase(args: string[]): Promise<void> {
 			// stdin satisfies the prompt without it ever entering argv.
 			cmd = [
 				'mongosh',
-				`mongodb://${host}:${port}/${c.database}`,
+				`mongodb://${host}:${port}/${c.databaseName}`,
 				'--username',
 				c.username,
 				'--password',
 			];
 			console.log(`Connecting to MongoDB ${bold(db.name)}...`);
 		} else if (engine === 'mysql' || engine === 'mariadb') {
-			cmd = ['mysql', '-h', host, '-P', String(port), '-u', c.username, c.database];
+			cmd = ['mysql', '-h', host, '-P', String(port), '-u', c.username, c.databaseName];
 			env.MYSQL_PWD = c.password;
 			console.log(`Connecting to ${engine} ${bold(db.name)}...`);
 		} else {
 			// Postgres: build per-flag args + PGPASSWORD so the password
 			// never lands in argv (was being passed via connectionUrl).
-			cmd = ['psql', '-h', host, '-p', String(port), '-U', c.username, '-d', c.database];
+			cmd = ['psql', '-h', host, '-p', String(port), '-U', c.username, '-d', c.databaseName];
 			env.PGPASSWORD = c.password;
 			console.log(`Connecting to PostgreSQL ${bold(db.name)}...`);
 		}
@@ -752,6 +785,101 @@ interface ClusterFailover {
 	newLeader: string | null;
 }
 
+interface RestorePoint {
+	id: number;
+	archiveName: string;
+	sizeBytes: number | null;
+	createdAt: string;
+	s3Url: string;
+}
+
+/** Bytes as a human reads them; `—` when the machine reported no size. */
+function formatBytes(bytes: number | null): string {
+	if (bytes === null) return dim('—');
+	const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+	let value = bytes;
+	let unit = 0;
+	while (value >= 1024 && unit < units.length - 1) {
+		value /= 1024;
+		unit++;
+	}
+	return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+/**
+ * The off-site archives a database could actually be restored from.
+ *
+ * Separate from what the machine has on its disk, which is what the dashboard's Backups page
+ * lists. On a machine of your own with no upload grant the dump lands on the disk holding the
+ * database, and a copy that dies with the original is not a copy — so this prints the rows the
+ * platform wrote when an archive reached object storage, and nothing else.
+ */
+async function listRestorePoints(args: string[]): Promise<void> {
+	const teamId = getTeamId();
+	if (!teamId) {
+		console.error(red('No team selected. Run: hoststack login --key <api-key>'));
+		process.exit(1);
+	}
+
+	const dbId = args[0];
+	if (!dbId) {
+		console.log(`${bold('Usage:')} hoststack db backups <database-id> [--json]`);
+		process.exit(1);
+	}
+	const jsonFlag = args.includes('--json');
+
+	try {
+		const { restorePoints } = await apiFetch<{ restorePoints: RestorePoint[] }>(
+			`/api/databases/${teamId}/${dbId}/restore-points`,
+		);
+
+		if (jsonFlag) {
+			console.log(JSON.stringify(restorePoints, null, 2));
+			return;
+		}
+
+		if (restorePoints.length === 0) {
+			// The distinction that matters: "backups are scheduled" and "a backup exists" are
+			// different claims, and only the second one is about recovery.
+			console.log(yellow(`No off-site backups recorded for database ${dbId}.`));
+			console.log(
+				dim('  The nightly schedule says one should exist. Either none has completed'),
+			);
+			console.log(
+				dim("  yet, or every dump is landing on the machine's own disk — which is the"),
+			);
+			console.log(dim('  same disk as the database, and so is not a copy of anything.'));
+			console.log(
+				dim(`  Why: hoststack db get ${dbId}  (lastBackupStatus, lastBackupError)`),
+			);
+			console.log(
+				dim('  A lastBackupStatus of offsite_failed means the upload was attempted'),
+			);
+			console.log(dim('  and failed, and lastBackupError carries the reason.'));
+			return;
+		}
+
+		console.log(
+			table(
+				['ID', 'Archive', 'Size', 'Taken'],
+				restorePoints.map((p) => [
+					String(p.id),
+					p.archiveName,
+					formatBytes(p.sizeBytes),
+					formatDate(p.createdAt),
+				]),
+			),
+		);
+		console.log();
+		console.log(
+			dim('Retention is a few days, so a short list is normal — it is the newest few'),
+		);
+		console.log(dim('restore points, not every backup ever taken.'));
+	} catch (err) {
+		handleError(err);
+	}
+}
+
 async function clusterInfo(args: string[]): Promise<void> {
 	const teamId = getTeamId();
 	if (!teamId) {
@@ -785,7 +913,7 @@ async function clusterInfo(args: string[]): Promise<void> {
 				live.map((m) => [
 					m.memberRole,
 					m.containerId.slice(0, 12),
-					new Date(m.joinedAt).toLocaleString(),
+					formatDateTime(m.joinedAt),
 				]),
 			),
 		);
@@ -800,7 +928,7 @@ async function clusterInfo(args: string[]): Promise<void> {
 				table(
 					['When', 'From', 'To'],
 					data.failovers.map((f) => [
-						new Date(f.createdAt).toLocaleString(),
+						formatDateTime(f.createdAt),
 						f.oldLeader ?? '—',
 						f.newLeader ?? '—',
 					]),
@@ -808,6 +936,215 @@ async function clusterInfo(args: string[]): Promise<void> {
 			);
 		}
 	} catch (err) {
+		handleError(err);
+	}
+}
+
+/**
+ * Restart the container in place. Same volume, same connection URL, a few
+ * seconds of downtime.
+ *
+ * Not `suspend` + `resume`: those are a deliberate stop with data preserved,
+ * and a suspended database is a billing and availability state somebody may be
+ * relying on. This is the "it is wedged, bounce it" verb, and the API refuses
+ * it on anything that is not `available` for exactly that reason.
+ */
+async function restartDatabase(args: string[]): Promise<void> {
+	const teamId = requireTeam();
+	const dbId = args[0];
+	if (!dbId) {
+		console.log(`${bold('Usage:')} hoststack db restart <database-id>`);
+		console.log();
+		console.log(dim('Bounces the container: same volume, same connection URL, seconds of'));
+		console.log(dim('downtime. Every open connection is dropped — clients must reconnect.'));
+		console.log(dim('The database must be available; resume a suspended one first.'));
+		process.exit(1);
+	}
+
+	const s = spinner('Restarting...');
+	try {
+		await apiFetch(`/api/databases/${teamId}/${dbId}/restart`, { method: 'POST' });
+		s.stop('Restarted');
+		console.log(dim('Connections were dropped. Apps with a pool reconnect on their own.'));
+	} catch (err) {
+		s.stop(red('Failed'));
+		handleError(err);
+	}
+}
+
+/** Rename, change plan tier, or grow the disk. Disk cannot shrink. */
+async function updateDatabase(args: string[]): Promise<void> {
+	const teamId = requireTeam();
+	const dbId = args[0]?.startsWith('--') ? undefined : args[0];
+	const name = flag(args, '--name');
+	const plan = flag(args, '--plan');
+	const disk = flag(args, '--disk');
+
+	if (!dbId || (name === undefined && plan === undefined && disk === undefined)) {
+		console.log(
+			`${bold('Usage:')} hoststack db update <database-id> [--name <name>] [--plan <${DB_PLANS.join('|')}>] [--disk <gb>]`,
+		);
+		console.log();
+		console.log(dim('  --plan changes the memory/CPU tier.'));
+		console.log(dim('  --disk GROWS the disk. Shrinking is refused: the filesystem under it'));
+		console.log(dim('  would orphan data, so there is no undo for a size you overshot.'));
+		process.exit(1);
+	}
+
+	const body: Record<string, unknown> = {};
+	if (name !== undefined) body.name = name;
+	if (plan !== undefined) {
+		if (!DB_PLANS.includes(plan)) {
+			console.error(red(`Unknown plan "${plan}". One of: ${DB_PLANS.join(', ')}.`));
+			process.exit(1);
+		}
+		body.plan = plan;
+	}
+	if (disk !== undefined) {
+		const parsed = Number.parseInt(disk, 10);
+		if (!Number.isInteger(parsed) || parsed < 1) {
+			console.error(red(`--disk must be a size in whole GB, got "${disk}".`));
+			process.exit(1);
+		}
+		body.diskSizeGb = parsed;
+	}
+
+	const s = spinner('Updating...');
+	try {
+		const { database } = await apiFetch<{ database: Database }>(
+			`/api/databases/${teamId}/${dbId}`,
+			{ method: 'PATCH', body: JSON.stringify(body) },
+		);
+		s.stop('Updated');
+		console.log(`${bold(database.name)} ${dim(`(${Object.keys(body).join(', ')})`)}`);
+	} catch (err) {
+		s.stop(red('Failed'));
+		handleError(err);
+	}
+}
+
+/** Plan tiers a managed database can sit on. Database sizes, not service sizes. */
+const DB_PLANS = ['free', 'micro', 'starter', 'standard', 'pro'];
+
+interface QueryResult {
+	columns: string[];
+	rows: string[][];
+	rowCount: number;
+	truncated: boolean;
+	durationMs: number;
+}
+
+/**
+ * One read-only statement against a managed Postgres.
+ *
+ * The read-only part is not this command's promise to keep — it is enforced
+ * server-side inside `BEGIN TRANSACTION READ ONLY`, with a 30s statement
+ * timeout and a 1000-row cap, and every call is audit-logged as
+ * `database.query` whether it succeeded or not. So this is for looking: a
+ * count, a sample, a constraint you are arguing with. Schema changes and seed
+ * data ship as migrations.
+ */
+async function queryDatabase(args: string[]): Promise<void> {
+	const teamId = requireTeam();
+	const dbId = args[0]?.startsWith('--') ? undefined : args[0];
+	const rawSql =
+		flag(args, '--sql') ?? (args[1] && !args[1].startsWith('--') ? args[1] : undefined);
+	const jsonFlag = args.includes('--json');
+
+	if (!dbId || rawSql === undefined) {
+		console.log(`${bold('Usage:')} hoststack db query <database-id> "<sql>" [--json]`);
+		console.log();
+		console.log(dim('  Postgres only. A single SELECT/WITH/SHOW/EXPLAIN, no trailing ";".'));
+		console.log(dim('  Enforced server-side: read-only transaction, 30s timeout, 1000 rows.'));
+		console.log(dim('  Every call is audit-logged — who queried what, and when.'));
+		console.log();
+		console.log(dim('  hoststack db query db_abc "SELECT count(*) FROM users"'));
+		process.exit(1);
+	}
+
+	// `-` reads the statement from stdin. Node APIs, not `Bun.stdin`: this
+	// bundle runs under Node once installed from npm.
+	let sql = rawSql;
+	try {
+		if (rawSql === '-') sql = (await readStream(process.stdin)).trim();
+	} catch (err) {
+		handleError(err);
+	}
+	if (sql.length === 0) {
+		console.error(red('No SQL given.'));
+		process.exit(1);
+	}
+
+	const s = jsonFlag ? null : spinner('Running...');
+	try {
+		const result = await apiFetch<QueryResult>(`/api/databases/${teamId}/${dbId}/query`, {
+			method: 'POST',
+			body: JSON.stringify({ sql }),
+		});
+
+		if (jsonFlag) {
+			console.log(JSON.stringify(result, null, 2));
+			return;
+		}
+
+		s?.stop(
+			`${result.rowCount} row${result.rowCount === 1 ? '' : 's'} in ${result.durationMs}ms`,
+		);
+		if (result.rowCount === 0) return;
+		console.log(table(result.columns, result.rows));
+
+		// The cap is silent in the data — a truncated 1000-row answer looks
+		// exactly like a complete one, which is how a count gets quoted wrong.
+		if (result.truncated) {
+			console.log();
+			console.log(yellow('Truncated at the server cap — this is not the whole result set.'));
+			console.log(dim('Add a LIMIT and an ORDER BY, or aggregate in SQL instead.'));
+		}
+	} catch (err) {
+		s?.stop(red('Failed'));
+		handleError(err);
+	}
+}
+
+/**
+ * In-place engine major-version upgrade. The agent dumps, recreates the
+ * container at the new version under the same DNS name, and restores — so
+ * connection URLs stay valid and nothing needs a redeploy.
+ */
+async function upgradeVersion(args: string[]): Promise<void> {
+	const teamId = requireTeam();
+	const dbId = args[0]?.startsWith('--') ? undefined : args[0];
+	const version =
+		flag(args, '--to') ?? (args[1] && !args[1].startsWith('--') ? args[1] : undefined);
+
+	if (!dbId || version === undefined) {
+		console.log(`${bold('Usage:')} hoststack db upgrade-version <database-id> --to <version>`);
+		console.log();
+		console.log(dim('  postgres: 18 | 17 | 16 | 15     redis: 8 | 7 | 6'));
+		console.log(dim('  Strictly newer only — downgrades are refused, and so are HA clusters'));
+		console.log(dim('  and engines where this is not implemented (mysql/mariadb/mongodb).'));
+		console.log(dim('  Seconds of downtime; the old container is rolled back on any failure.'));
+		console.log();
+		console.log(dim(`  Current version: hoststack db get <database-id>`));
+		process.exit(1);
+	}
+
+	const s = spinner('Starting upgrade...');
+	try {
+		await apiFetch(`/api/databases/${teamId}/${dbId}/upgrade-version`, {
+			method: 'POST',
+			body: JSON.stringify({ version }),
+		});
+		// 202 — accepted, not finished. Saying "upgraded" here would be the
+		// same false claim `domains verify` used to make on any 200.
+		s.stop('Upgrade started');
+		console.log(
+			dim(
+				`Async. Poll with: hoststack db get ${dbId} — done when version=${version} and status=available.`,
+			),
+		);
+	} catch (err) {
+		s.stop(red('Failed'));
 		handleError(err);
 	}
 }

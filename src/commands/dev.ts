@@ -232,8 +232,12 @@ async function createDevEnv(args: string[]): Promise<void> {
 			}
 			const eq = pair.indexOf('=');
 			const key = pair.slice(0, eq);
-			if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) {
-				console.error(red(`Invalid env key "${key}". Use uppercase + underscores.`));
+			if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+				console.error(
+					red(
+						`Invalid env key "${key}". Use letters, digits and underscores, not starting with a digit.`,
+					),
+				);
 				process.exit(1);
 			}
 			envVars.push({ key, value: pair.slice(eq + 1), isSecret: true });

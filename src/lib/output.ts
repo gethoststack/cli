@@ -116,7 +116,24 @@ export function handleError(err: unknown): never {
 	if (err instanceof Error) {
 		console.error(`${red('Error:')} ${err.message}`);
 	} else {
-		console.error(`${red('Error:')} ${String(err)}`);
+		console.error(`${red('Error:')} ${describeThrown(err)}`);
 	}
 	process.exit(1);
+}
+
+/** A thrown non-Error as text: its own message when it has one, never `[object Object]`. */
+function describeThrown(err: unknown): string {
+	if (typeof err === 'string') return err;
+	if (typeof err === 'object' && err !== null) {
+		const message =
+			(err as { message?: unknown; error?: unknown }).message ??
+			(err as { error?: unknown }).error;
+		if (typeof message === 'string') return message;
+		try {
+			return JSON.stringify(err);
+		} catch {
+			return 'Unknown error';
+		}
+	}
+	return String(err);
 }

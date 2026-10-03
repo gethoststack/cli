@@ -29,12 +29,17 @@ delete process.env.HOSTSTACK_API_URL;
 delete process.env.HOSTSTACK_TEAM_ID;
 mkdirSync(join(tmp, '.hoststack'), { recursive: true });
 
+import { activityCommand } from '../commands/activity.ts';
+import { alertsCommand } from '../commands/alerts.ts';
+import { dbCommand } from '../commands/db.ts';
 import { deployCommand } from '../commands/deploy.ts';
 import { devCommand } from '../commands/dev.ts';
 import { domainsCommand } from '../commands/domains.ts';
 import { envCommand } from '../commands/env.ts';
+import { infraCommand } from '../commands/infra.ts';
 import { initCommand } from '../commands/init.ts';
 import { loginCommand } from '../commands/login.ts';
+import { logsCommand, normalizeSince } from '../commands/logs.ts';
 import { machinesCommand } from '../commands/machines.ts';
 import { projectsCommand } from '../commands/projects.ts';
 import { servicesCommand } from '../commands/services.ts';
@@ -517,6 +522,48 @@ describe('servicesCommand', () => {
 		} finally {
 			restore();
 		}
+	});
+
+	/**
+	 * `--repo owner/name` is sent as `githubRepo` for the API to resolve.
+	 *
+	 * It used to be resolved here first, by GETting /api/github/:teamId/repos —
+	 * typed as a bare array against an endpoint that answers `{ repos: [...] }`,
+	 * so every `--repo` create died on `repos.find is not a function`. Nothing
+	 * covered it, which is most of why it survived. This asserts BOTH halves:
+	 * the field goes out, and no repo lookup happens on the way.
+	 */
+	test('create sends --repo as githubRepo, without a client-side lookup', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const seen: { url: string; body: unknown }[] = [];
+		installFetch((url, init) => {
+			seen.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+			return new Response(JSON.stringify({ service: { id: 1, publicId: 'svc_abc' } }), {
+				status: 201,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { restore } = captureIO();
+		try {
+			await servicesCommand([
+				'create',
+				'--name',
+				'sten',
+				'--type',
+				'web_service',
+				'--project',
+				'7',
+				'--repo',
+				'miccidk/stenshoppen',
+			]);
+		} finally {
+			restore();
+		}
+
+		expect(seen.map((r) => r.url).some((u) => u.includes('/api/github/'))).toBe(false);
+		const post = seen.find((r) => r.url.includes('/api/services/'));
+		expect(post?.body).toMatchObject({ githubRepo: 'miccidk/stenshoppen', projectId: 7 });
+		expect(post?.body).not.toHaveProperty('githubRepoId');
 	});
 
 	test('scale rejects non-numeric spec', async () => {
@@ -1956,5 +2003,1282 @@ describe('--machine placement flag', () => {
 		// And no machines request either — the default path must not pay for a
 		// lookup it does not use.
 		expect(calls.some((c) => c.url.includes('/api/machines/'))).toBe(false);
+	});
+});
+
+// ── alertsCommand ────────────────────────────────────────────────────────
+describe('alertsCommand', () => {
+	const aggregated = {
+		alerts: [
+			{
+				action: 'deploy.failed_consecutive',
+				resourceType: 'service',
+				resourceId: 31,
+				severity: 'critical',
+				count: 3,
+				firstFiredAt: '2026-01-01T09:00:00.000Z',
+				lastFiredAt: '2026-01-01T09:20:00.000Z',
+				lastResolvedAt: null,
+				active: true,
+				lastMetadata: { commitHash: 'abc1234' },
+			},
+		],
+		aggregated: true,
+		activeOnly: true,
+	};
+
+	test('list defaults to the narrow view — no aggregate=0, no active=0', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const urls: string[] = [];
+		installFetch((url) => {
+			urls.push(url);
+			return new Response(JSON.stringify(aggregated), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await alertsCommand([]);
+			expect(urls[0]).toContain('/api/alerts/42');
+			// Both flags default to "1" server-side. Shipping them explicitly
+			// would be noise; shipping the wrong one silently widens triage.
+			expect(urls[0]).not.toContain('aggregate=');
+			expect(urls[0]).not.toContain('active=');
+			expect(cap.out.join('\n')).toContain('deploy.failed_consecutive');
+			expect(cap.out.join('\n')).toContain('3x');
+		} finally {
+			restore();
+		}
+	});
+
+	test('--raw and --all opt out of both defaults', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const urls: string[] = [];
+		installFetch((url) => {
+			urls.push(url);
+			return new Response(
+				JSON.stringify({ alerts: [], aggregated: false, activeOnly: false }),
+				{ status: 200, headers: { 'Content-Type': 'application/json' } },
+			);
+		});
+		const { restore } = captureIO();
+		try {
+			await alertsCommand(['list', '--raw', '--all', '--since', '-6h', '--limit', '5']);
+			expect(urls[0]).toContain('aggregate=0');
+			expect(urls[0]).toContain('active=0');
+			expect(urls[0]).toContain('since=-6h');
+			expect(urls[0]).toContain('limit=5');
+		} finally {
+			restore();
+		}
+	});
+
+	test('a bare flag is treated as list, not an unknown subcommand', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const urls: string[] = [];
+		installFetch((url) => {
+			urls.push(url);
+			return new Response(JSON.stringify(aggregated), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await alertsCommand(['--since', '-1h']);
+			expect(urls[0]).toContain('since=-1h');
+			expect(cap.exitCode).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+
+	test('resolve posts the whole four-field identity, nulls included', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const calls: Array<{ url: string; method: string; body?: string }> = [];
+		installFetch((url, init) => {
+			calls.push({
+				url,
+				method: (init?.method ?? 'GET').toUpperCase(),
+				body: init?.body as string | undefined,
+			});
+			return new Response(JSON.stringify({ resolved: 2 }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { restore } = captureIO();
+		try {
+			await alertsCommand([
+				'resolve',
+				'--action',
+				'service.acme_cert_failed',
+				'--severity',
+				'error',
+			]);
+			const post = calls.find((c) => c.method === 'POST');
+			expect(post?.url).toContain('/api/alerts/42/resolve');
+			// resourceType/resourceId must travel as explicit nulls: a
+			// team-wide alert genuinely has neither, and the endpoint matches
+			// them with IS NOT DISTINCT FROM.
+			expect(JSON.parse(post!.body as string)).toEqual({
+				action: 'service.acme_cert_failed',
+				severity: 'error',
+				resourceType: null,
+				resourceId: null,
+			});
+		} finally {
+			restore();
+		}
+	});
+
+	test('resolve refuses a severity the endpoint would not group on', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		let called = false;
+		installFetch(() => {
+			called = true;
+			return new Response('{}', { status: 200 });
+		});
+		const { cap, restore } = captureIO();
+		try {
+			try {
+				await alertsCommand(['resolve', '--action', 'x', '--severity', 'bad']);
+			} catch {
+				/* expected process.exit */
+			}
+			expect(called).toBe(false);
+			expect(cap.err.join('\n')).toContain('Unknown severity');
+		} finally {
+			restore();
+		}
+	});
+
+	test('channels add rejects an invented event before the request', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		let called = false;
+		installFetch(() => {
+			called = true;
+			return new Response('{}', { status: 200 });
+		});
+		const { cap, restore } = captureIO();
+		try {
+			try {
+				await alertsCommand([
+					'channels',
+					'add',
+					'--type',
+					'slack',
+					'--name',
+					'ops',
+					'--url',
+					'https://hooks.slack.test/x',
+					'--events',
+					'deploy.failed,deploy.exploded',
+				]);
+			} catch {
+				/* expected process.exit */
+			}
+			expect(called).toBe(false);
+			expect(cap.err.join('\n')).toContain('deploy.exploded');
+		} finally {
+			restore();
+		}
+	});
+
+	test('channels add --events all expands to the whole list', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		let sent: Record<string, unknown> = {};
+		installFetch((_url, init) => {
+			sent = JSON.parse(init?.body as string) as Record<string, unknown>;
+			return new Response(
+				JSON.stringify({
+					channel: {
+						id: 7,
+						type: 'slack',
+						name: 'ops',
+						events: sent.events,
+						active: true,
+					},
+				}),
+				{ status: 201, headers: { 'Content-Type': 'application/json' } },
+			);
+		});
+		const { restore } = captureIO();
+		try {
+			await alertsCommand([
+				'channels',
+				'add',
+				'--type',
+				'slack',
+				'--name',
+				'ops',
+				'--url',
+				'https://hooks.slack.test/x',
+				'--events',
+				'all',
+			]);
+			expect(Array.isArray(sent.events)).toBe(true);
+			expect((sent.events as string[]).length).toBeGreaterThan(40);
+			expect(sent.webhookUrl).toBe('https://hooks.slack.test/x');
+		} finally {
+			restore();
+		}
+	});
+
+	test('channels test reports the BODY outcome, not the 200', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		installFetch(
+			() =>
+				new Response(JSON.stringify({ success: false, error: 'slack said 404' }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				}),
+		);
+		const { cap, restore } = captureIO();
+		try {
+			try {
+				await alertsCommand(['channels', 'test', '7']);
+			} catch {
+				/* expected process.exit */
+			}
+			// A 200 here means "dispatch attempted". Printing "sent" on it is
+			// the same lie `domains verify` used to tell.
+			expect(cap.exitCode).toBe(1);
+			expect(cap.out.join('\n')).toContain('slack said 404');
+		} finally {
+			restore();
+		}
+	});
+});
+
+// ── activityCommand ──────────────────────────────────────────────────────
+describe('activityCommand', () => {
+	const page = {
+		data: [
+			{
+				id: 1,
+				action: 'env_var.deleted',
+				severity: 'info',
+				resourceType: 'service',
+				resourceId: 48,
+				metadata: {},
+				ipAddress: '203.0.113.9',
+				userId: 2,
+				userName: 'Ada',
+				userEmail: 'ada@example.test',
+				createdAt: '2026-01-01T09:00:00.000Z',
+				resolvedAt: null,
+			},
+		],
+		page: 1,
+		perPage: 25,
+		total: 60,
+		totalPages: 3,
+	};
+
+	test('maps its flags onto the API query names', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const urls: string[] = [];
+		installFetch((url) => {
+			urls.push(url);
+			return new Response(JSON.stringify(page), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await activityCommand([
+				'--type',
+				'deploy',
+				'--user',
+				'2',
+				'--since',
+				'-2h',
+				'--per-page',
+				'10',
+			]);
+			const url = urls[0] ?? '';
+			expect(url).toContain('resourceType=deploy');
+			expect(url).toContain('userId=2');
+			expect(url).toContain('since=-2h');
+			expect(url).toContain('perPage=10');
+			// Paging stated, not implied: page 1 of 3 must be visible.
+			expect(cap.out.join('\n')).toContain('Page 1 of 3');
+		} finally {
+			restore();
+		}
+	});
+
+	test('a non-numeric --user is refused here, not silently matched there', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		let called = false;
+		installFetch(() => {
+			called = true;
+			return new Response('{}', { status: 200 });
+		});
+		const { cap, restore } = captureIO();
+		try {
+			try {
+				await activityCommand(['--user', 'ada']);
+			} catch {
+				/* expected process.exit */
+			}
+			expect(called).toBe(false);
+			expect(cap.err.join('\n')).toContain('--user');
+		} finally {
+			restore();
+		}
+	});
+
+	test('a platform-actor row does not render as missing data', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		installFetch(
+			() =>
+				new Response(
+					JSON.stringify({
+						...page,
+						data: [{ ...page.data[0], userId: null, userName: null, userEmail: null }],
+						totalPages: 1,
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } },
+				),
+		);
+		const { cap, restore } = captureIO();
+		try {
+			await activityCommand([]);
+			expect(cap.out.join('\n')).toContain('platform');
+		} finally {
+			restore();
+		}
+	});
+});
+
+// ── deploy diagnose / promote ────────────────────────────────────────────
+describe('deployCommand diagnose', () => {
+	function deployRow(status: string) {
+		return {
+			deploy: {
+				id: 1,
+				publicId: 'dpl_x',
+				status,
+				trigger: 'manual',
+				commitHash: 'abc1234567',
+				commitMessage: 'do the thing',
+				createdAt: '2026-01-01T09:00:00.000Z',
+				startedAt: '2026-01-01T09:00:05.000Z',
+			},
+		};
+	}
+
+	test('a build-time failure never fetches runtime logs', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const urls: string[] = [];
+		installFetch((url) => {
+			urls.push(url);
+			if (url.includes('/logs'))
+				return new Response(JSON.stringify({ logs: [] }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			return new Response(JSON.stringify(deployRow('building')), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await deployCommand(['diagnose', 'svc_1', 'dpl_x']);
+			// The previous release's output is what that request would have
+			// returned, and it reads exactly like the new one working.
+			expect(urls.some((u) => u.includes('runtime-logs'))).toBe(false);
+			expect(cap.out.join('\n')).toContain('never started a container');
+		} finally {
+			restore();
+		}
+	});
+
+	test('a deploy that ran pulls the runtime tail bounded by its own start', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const urls: string[] = [];
+		installFetch((url) => {
+			urls.push(url);
+			if (url.includes('runtime-logs'))
+				return new Response(JSON.stringify({ logs: [{ message: 'listening on 3000' }] }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			if (url.includes('/logs'))
+				return new Response(
+					JSON.stringify({ logs: [{ id: 1, level: 'info', message: 'built' }] }),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } },
+				);
+			return new Response(JSON.stringify(deployRow('failed')), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await deployCommand(['diagnose', 'svc_1', 'dpl_x', '--runtime-lines', '5']);
+			const runtime = urls.find((u) => u.includes('runtime-logs')) ?? '';
+			expect(runtime).toContain('lines=5');
+			expect(runtime).toContain('since=2026-01-01T09%3A00%3A05.000Z');
+			expect(cap.out.join('\n')).toContain('listening on 3000');
+		} finally {
+			restore();
+		}
+	});
+
+	test('--runtime-lines 0 skips the runtime half outright', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const urls: string[] = [];
+		installFetch((url) => {
+			urls.push(url);
+			if (url.includes('/logs'))
+				return new Response(JSON.stringify({ logs: [] }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			return new Response(JSON.stringify(deployRow('live')), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { restore } = captureIO();
+		try {
+			await deployCommand(['diagnose', 'svc_1', 'dpl_x', '--runtime-lines', '0']);
+			expect(urls.some((u) => u.includes('runtime-logs'))).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	test('promote resolves an env_… publicId to the numeric id the API wants', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const calls: Array<{ url: string; method: string; body?: string }> = [];
+		installFetch((url, init) => {
+			calls.push({
+				url,
+				method: (init?.method ?? 'GET').toUpperCase(),
+				body: init?.body as string | undefined,
+			});
+			if (url.includes('/api/environments/'))
+				return new Response(
+					JSON.stringify({
+						environments: [{ id: 9, publicId: 'env_prod', name: 'prod' }],
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } },
+				);
+			if (url.includes('/api/projects/'))
+				return new Response(JSON.stringify({ projects: [{ id: 1, publicId: 'prj_a' }] }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			return new Response(
+				JSON.stringify({
+					deploy: {
+						id: 2,
+						publicId: 'dpl_new',
+						status: 'pending',
+						trigger: 'rollback',
+						createdAt: '2026-01-01',
+					},
+				}),
+				{ status: 201, headers: { 'Content-Type': 'application/json' } },
+			);
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await deployCommand(['promote', 'svc_1', 'dpl_x', '--to', 'env_prod']);
+			const post = calls.find((c) => c.method === 'POST' && c.url.includes('/promote'));
+			expect(post).toBeDefined();
+			// `environments list` prints publicIds; the route takes a number.
+			expect(JSON.parse(post!.body as string)).toEqual({ targetEnvironmentId: 9 });
+			// The one thing that bites after a promote, said every time.
+			expect(cap.out.join('\n')).toContain('did not come with it');
+		} finally {
+			restore();
+		}
+	});
+});
+
+// ── db query / restart / update ──────────────────────────────────────────
+describe('dbCommand additions', () => {
+	test('query posts the sql and names the server cap when truncated', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const calls: Array<{ url: string; method: string; body?: string }> = [];
+		installFetch((url, init) => {
+			calls.push({
+				url,
+				method: (init?.method ?? 'GET').toUpperCase(),
+				body: init?.body as string | undefined,
+			});
+			return new Response(
+				JSON.stringify({
+					columns: ['id'],
+					rows: [['1'], ['2']],
+					rowCount: 2,
+					truncated: true,
+					durationMs: 12,
+				}),
+				{ status: 200, headers: { 'Content-Type': 'application/json' } },
+			);
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await dbCommand(['query', 'db_abc', 'SELECT id FROM users']);
+			const post = calls.find((c) => c.method === 'POST');
+			expect(post?.url).toContain('/api/databases/42/db_abc/query');
+			expect(JSON.parse(post!.body as string)).toEqual({ sql: 'SELECT id FROM users' });
+			// A capped result looks exactly like a complete one in the data.
+			expect(cap.out.join('\n')).toContain('Truncated');
+		} finally {
+			restore();
+		}
+	});
+
+	test('update sends only the fields given, and refuses an unknown plan', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const calls: Array<{ method: string; body?: string }> = [];
+		installFetch((_url, init) => {
+			calls.push({
+				method: (init?.method ?? 'GET').toUpperCase(),
+				body: init?.body as string | undefined,
+			});
+			return new Response(JSON.stringify({ database: { id: 1, name: 'app-db' } }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await dbCommand(['update', 'db_abc', '--disk', '50']);
+			const patch = calls.find((c) => c.method === 'PATCH');
+			expect(JSON.parse(patch!.body as string)).toEqual({ diskSizeGb: 50 });
+
+			calls.length = 0;
+			try {
+				await dbCommand(['update', 'db_abc', '--plan', 'enormous']);
+			} catch {
+				/* expected process.exit */
+			}
+			expect(calls.some((c) => c.method === 'PATCH')).toBe(false);
+			expect(cap.err.join('\n')).toContain('Unknown plan');
+		} finally {
+			restore();
+		}
+	});
+
+	test('restart hits the restart route, not suspend+resume', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const urls: string[] = [];
+		installFetch((url) => {
+			urls.push(url);
+			return new Response('{}', {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { restore } = captureIO();
+		try {
+			await dbCommand(['restart', 'db_abc']);
+			expect(urls[0]).toContain('/api/databases/42/db_abc/restart');
+			expect(urls.some((u) => u.includes('/suspend'))).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+});
+
+// ── domains update ───────────────────────────────────────────────────────
+describe('domainsCommand update', () => {
+	const listRow = {
+		id: 131,
+		publicId: 'dom_x',
+		domain: 'example.com',
+		status: 'active',
+		serviceId: 198,
+		isPrimary: false,
+		createdAt: '2026-09-11T09:25:03.438Z',
+	};
+
+	/** GET returns the team's domains; anything else returns the patched row. */
+	function domainFetch(calls: Array<{ url: string; method: string; body?: string }>) {
+		installFetch((url, init) => {
+			const method = (init?.method ?? 'GET').toUpperCase();
+			calls.push({ url, method, body: init?.body as string | undefined });
+			if (method === 'GET') {
+				return new Response(JSON.stringify({ domains: [listRow] }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			return new Response(JSON.stringify({ domain: { ...listRow, isPrimary: true } }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+	}
+
+	test('--primary resolves the publicId to the numeric id the route needs', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const calls: Array<{ url: string; method: string; body?: string }> = [];
+		domainFetch(calls);
+		const { cap, restore } = captureIO();
+		try {
+			await domainsCommand(['update', 'dom_x', '--primary']);
+			const patch = calls.find((c) => c.method === 'PATCH');
+			// `parseIdParam` on the route rejects a dom_… outright — this used
+			// to come back "Invalid domain ID" for the id `domains list` prints.
+			expect(patch?.url).toContain('/api/domains/42/131');
+			expect(JSON.parse(patch!.body as string)).toEqual({ isPrimary: true });
+			expect(cap.out.join('\n')).toContain('uptime check probes');
+		} finally {
+			restore();
+		}
+	});
+
+	test('the hostname itself resolves too — it is what people are holding', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const calls: Array<{ url: string; method: string; body?: string }> = [];
+		domainFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await domainsCommand(['update', 'example.com', '--primary']);
+			expect(calls.find((c) => c.method === 'PATCH')?.url).toContain('/api/domains/42/131');
+		} finally {
+			restore();
+		}
+	});
+
+	test('an unknown domain never reaches the route', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const calls: Array<{ url: string; method: string; body?: string }> = [];
+		domainFetch(calls);
+		const { cap, restore } = captureIO();
+		try {
+			try {
+				await domainsCommand(['update', 'nope.example.com', '--primary']);
+			} catch {
+				/* expected process.exit */
+			}
+			expect(calls.some((c) => c.method === 'PATCH')).toBe(false);
+			expect(cap.err.join('\n')).toContain('nope.example.com');
+		} finally {
+			restore();
+		}
+	});
+
+	test('--no-redirect clears with an explicit null, not an empty string', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const calls: Array<{ url: string; method: string; body?: string }> = [];
+		domainFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await domainsCommand(['update', 'dom_x', '--no-redirect']);
+			const patch = calls.find((c) => c.method === 'PATCH');
+			expect(JSON.parse(patch!.body as string)).toEqual({ redirectTo: null });
+		} finally {
+			restore();
+		}
+	});
+
+	test('update with no field to change sends nothing', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		let called = false;
+		installFetch(() => {
+			called = true;
+			return new Response('{}', { status: 200 });
+		});
+		const { cap, restore } = captureIO();
+		try {
+			try {
+				await domainsCommand(['update', 'dom_x']);
+			} catch {
+				/* expected process.exit */
+			}
+			expect(called).toBe(false);
+			expect(cap.out.join('\n')).toContain('--primary');
+		} finally {
+			restore();
+		}
+	});
+
+	test('list names the silent fallback when a service has no primary', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		installFetch(
+			() =>
+				new Response(
+					JSON.stringify({
+						domains: [
+							{
+								id: 118,
+								publicId: 'dom_old',
+								domain: 'staging.example.com',
+								status: 'active',
+								serviceId: 198,
+								isPrimary: false,
+								createdAt: '2026-08-25T10:05:12.864Z',
+							},
+							{
+								id: 131,
+								publicId: 'dom_new',
+								domain: 'example.com',
+								status: 'active',
+								serviceId: 198,
+								isPrimary: false,
+								createdAt: '2026-09-11T09:25:03.438Z',
+							},
+						],
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } },
+				),
+		);
+		const { cap, restore } = captureIO();
+		try {
+			await domainsCommand(['list']);
+			const out = cap.out.join('\n');
+			// The fallback is the OLDEST domain — on a renamed host, the alias
+			// that redirects. This is what pointed an uptime check at a 301.
+			expect(out).toContain('no primary nominated');
+			expect(out).toContain('staging.example.com');
+			expect(out).toContain('domains update');
+			// Neither fixture carries a `verified` boolean, because the route
+			// does not return one. Reading it printed "no" for every domain on
+			// the team, live ones included; `status` is the real signal.
+			expect(out).not.toMatch(/\bno\b\s*\|/);
+		} finally {
+			restore();
+		}
+	});
+});
+
+// ── envCommand import ────────────────────────────────────────────────────
+describe('envCommand import', () => {
+	const SECRET = '$2y$10$abcdefghijklmnopqrstuv.WXYZ0123456789abcdefghijklmnopq';
+
+	function writeEnvFile(contents: string): string {
+		const path = join(tmp, 'prod.env');
+		writeFileSync(path, contents);
+		return path;
+	}
+
+	test('a dry run sends the file unapplied and prints keys and refusals, never a value', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const file = writeEnvFile(`GOOD='${SECRET}'\nBAD=${SECRET}\n`);
+		let sent: Record<string, unknown> | null = null;
+		installFetch((_url, init) => {
+			sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return new Response(
+				JSON.stringify({
+					dryRun: true,
+					applied: false,
+					mode: 'merge',
+					refusals: [{ line: 2, reason: 'BAD: the unquoted value contains "$"' }],
+					warnings: [],
+					plan: [{ key: 'GOOD', action: 'add' }],
+				}),
+				{ status: 200, headers: { 'Content-Type': 'application/json' } },
+			);
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await envCommand(['import', 'svc_mail', file]).catch(() => {});
+			expect(sent).toMatchObject({
+				dryRun: true,
+				mode: 'merge',
+				target: 'runtime',
+				isSecret: true,
+			});
+			const printed = [...cap.out, ...cap.err].join('\n');
+			expect(printed).toContain('GOOD');
+			expect(printed).toContain('line 2');
+			expect(printed).not.toContain('abcdefghijklmnop');
+			expect(cap.exitCode).toBe(1);
+		} finally {
+			restore();
+		}
+	});
+
+	test('--apply --replace writes and reports the round trip', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const file = writeEnvFile(`GOOD='${SECRET}'\n`);
+		let sent: Record<string, unknown> | null = null;
+		installFetch((_url, init) => {
+			sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return new Response(
+				JSON.stringify({
+					dryRun: false,
+					applied: true,
+					mode: 'replace',
+					refusals: [],
+					warnings: [],
+					plan: [{ key: 'GOOD', action: 'add' }],
+					roundTrip: { verified: 1, mismatched: [] },
+				}),
+				{ status: 200, headers: { 'Content-Type': 'application/json' } },
+			);
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await envCommand(['import', 'svc_mail', file, '--apply', '--replace']);
+			expect(sent).toMatchObject({ dryRun: false, mode: 'replace' });
+			expect(cap.out.join('\n')).toContain('byte for byte');
+			expect(cap.exitCode).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+
+	test('a file that is not valid UTF-8 is an error, and nothing is sent', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const path = join(tmp, 'latin1.env');
+		// "SMTP_BANNER='Grüße'" in Latin-1: 0xFC and 0xDF are not UTF-8.
+		writeFileSync(
+			path,
+			Buffer.concat([
+				Buffer.from("SMTP_BANNER='Gr"),
+				Buffer.from([0xfc, 0xdf]),
+				Buffer.from("e'\n"),
+			]),
+		);
+		let called = false;
+		installFetch(() => {
+			called = true;
+			return new Response('{}', { status: 200 });
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await envCommand(['import', 'svc_mail', path]).catch(() => {});
+			expect(cap.exitCode).toBe(1);
+			expect(cap.err.join('\n')).toContain('not valid UTF-8');
+			expect(called).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+
+	test('an unreadable file is an error, and nothing is sent', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		let called = false;
+		installFetch(() => {
+			called = true;
+			return new Response('{}', { status: 200 });
+		});
+		const { cap, restore } = captureIO();
+		try {
+			await envCommand(['import', 'svc_mail', join(tmp, 'missing.env')]).catch(() => {});
+			expect(cap.exitCode).toBe(1);
+			expect(called).toBe(false);
+		} finally {
+			restore();
+		}
+	});
+});
+
+// ── infraCommand ─────────────────────────────────────────────────────────
+// `hoststack infra` runs a cutover's operator steps with a short-lived infra operator token. The
+// two things that matter: it never borrows the saved API key, and what it sends is exactly what
+// was asked for — a policy file byte for byte, and no full rollout unless the flag says so.
+describe('infraCommand', () => {
+	const TOKEN = `hsiot_${'a'.repeat(64)}`;
+	type Call = { url: string; method?: string; body?: string; auth?: string };
+
+	const PLAN_TOKEN = `hsrpt_${'b'.repeat(64)}`;
+
+	// Before as well as after: a dev box is SEEDED with a real plan token in its
+	// environment, so without this the first "no token" test ran with one and
+	// failed — and so did the deploy gate on that box.
+	const savedTokens = {
+		infra: process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN,
+		plan: process.env.HOSTSTACK_RELEASE_PLAN_TOKEN,
+	};
+	beforeEach(() => {
+		delete process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN;
+		delete process.env.HOSTSTACK_RELEASE_PLAN_TOKEN;
+	});
+	afterEach(() => {
+		delete process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN;
+		delete process.env.HOSTSTACK_RELEASE_PLAN_TOKEN;
+	});
+	afterAll(() => {
+		if (savedTokens.infra !== undefined)
+			process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = savedTokens.infra;
+		if (savedTokens.plan !== undefined)
+			process.env.HOSTSTACK_RELEASE_PLAN_TOKEN = savedTokens.plan;
+	});
+
+	function infraFetch(calls: Call[]) {
+		installFetch((url, init) => {
+			const headers = (init?.headers ?? {}) as Record<string, string>;
+			calls.push({
+				url,
+				method: init?.method,
+				body: init?.body as string | undefined,
+				auth: headers.Authorization,
+			});
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+	}
+
+	test('refuses to run without an infra operator token, and never falls back to the API key', async () => {
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { cap, restore } = captureIO();
+		try {
+			await infraCommand(['release', 'get', 'rel_x']);
+		} catch {
+			// process.exit is stubbed to throw.
+		} finally {
+			restore();
+		}
+		expect(cap.exitCode).toBe(1);
+		expect(cap.err.join('\n')).toContain('HOSTSTACK_INFRA_OPERATOR_TOKEN');
+		expect(calls).toHaveLength(0);
+	});
+
+	test('plans a release with the token as the bearer, and no full rollout unless asked', async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand(['release', 'plan', '15', '--commit', 'b'.repeat(40)]);
+		} finally {
+			restore();
+		}
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.url).toEndWith('/api/admin/projects/15/releases');
+		expect(calls[0]!.method).toBe('POST');
+		expect(calls[0]!.auth).toBe(`Bearer ${TOKEN}`);
+		expect(JSON.parse(calls[0]!.body ?? '{}')).toEqual({
+			commitSha: 'b'.repeat(40),
+			allowFullRollout: false,
+		});
+	});
+
+	// Task 450: the id had to come from somewhere, and until this there was no command that would
+	// tell you one — not here and not in the dashboard.
+	test("lists a project's releases with either token", async () => {
+		process.env.HOSTSTACK_RELEASE_PLAN_TOKEN = PLAN_TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand(['release', 'list', '15']);
+		} finally {
+			restore();
+		}
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.url).toEndWith('/api/admin/projects/15/releases');
+		expect(calls[0]!.method ?? 'GET').toBe('GET');
+		expect(calls[0]!.auth).toBe(`Bearer ${PLAN_TOKEN}`);
+	});
+
+	// Task 447: the CLI minted plan tokens and had no code path for one, so the supported command
+	// worked with exactly the credential that should not be on a dev box and not with the one that
+	// should. These four are the whole contract: which commands take a plan token, which do not,
+	// what the refusal says, and which token wins when both are set.
+	test('runs a release read and a start with a plan token alone', async () => {
+		process.env.HOSTSTACK_RELEASE_PLAN_TOKEN = PLAN_TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand(['release', 'get', 'rel_x']);
+			// Whether THIS token may start is a fact about the token record, which only the API can
+			// read — so the CLI sends it rather than inventing a client-side rule.
+			await infraCommand(['release', 'start', 'rel_x']);
+		} finally {
+			restore();
+		}
+		expect(calls.map((c) => [c.method ?? 'GET', c.url.split('/api')[1], c.auth])).toEqual([
+			['GET', '/admin/releases/rel_x', `Bearer ${PLAN_TOKEN}`],
+			['POST', '/admin/releases/rel_x/start', `Bearer ${PLAN_TOKEN}`],
+		]);
+	});
+
+	// Task 451: the token in the environment can be read without using it, and only ever with the
+	// plan token — an operator token beside it is not what the question is about.
+	test('plan-token whoami asks about the plan token even when an operator token is set', async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		process.env.HOSTSTACK_RELEASE_PLAN_TOKEN = PLAN_TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand(['plan-token', 'whoami']);
+		} finally {
+			restore();
+		}
+		expect(calls.map((c) => [c.method ?? 'GET', c.url.split('/api')[1], c.auth])).toEqual([
+			['GET', '/admin/release-plan-token', `Bearer ${PLAN_TOKEN}`],
+		]);
+	});
+
+	test('plan-token --dev-box binds the minted token to a box', async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand([
+				'plan-token',
+				'15',
+				'--name',
+				'poststack box',
+				'--days',
+				'30',
+				'--can-start',
+				'--dev-box',
+				'svc_abc123',
+			]);
+		} finally {
+			restore();
+		}
+		expect(calls[0]!.url).toEndWith('/api/admin/projects/15/release-plan-tokens');
+		expect(JSON.parse(calls[0]!.body ?? '{}')).toEqual({
+			name: 'poststack box',
+			expiresInDays: 30,
+			canStart: true,
+			devBox: 'svc_abc123',
+		});
+	});
+
+	test('refuses an operator-only command to a plan token, naming what the plan token CAN run', async () => {
+		process.env.HOSTSTACK_RELEASE_PLAN_TOKEN = PLAN_TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { cap, restore } = captureIO();
+		try {
+			await infraCommand(['release', 'rollback', 'rel_x']);
+		} catch {
+			// process.exit is stubbed to throw.
+		} finally {
+			restore();
+		}
+		expect(cap.exitCode).toBe(1);
+		const message = cap.err.join('\n');
+		expect(message).toContain('needs an infra operator token');
+		expect(message).toContain('release plan');
+		expect(message).toContain('--can-start');
+		// Never the token itself, or a prefix of it.
+		expect(message).not.toContain(PLAN_TOKEN);
+		expect(message).not.toContain(PLAN_TOKEN.slice(0, 20));
+		expect(calls).toHaveLength(0);
+	});
+
+	test('prefers the operator token when both are set, and falls back on a 401', async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		process.env.HOSTSTACK_RELEASE_PLAN_TOKEN = PLAN_TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand(['release', 'get', 'rel_x']);
+		} finally {
+			restore();
+		}
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.auth).toBe(`Bearer ${TOKEN}`);
+
+		// An expired operator token with a live plan token beside it should still read.
+		const retried: Call[] = [];
+		installFetch((url, init) => {
+			const headers = (init?.headers ?? {}) as Record<string, string>;
+			retried.push({ url, method: init?.method, auth: headers.Authorization });
+			return headers.Authorization === `Bearer ${TOKEN}`
+				? new Response(JSON.stringify({ error: 'expired' }), {
+						status: 401,
+						headers: { 'Content-Type': 'application/json' },
+					})
+				: new Response(JSON.stringify({ ok: true }), {
+						status: 200,
+						headers: { 'Content-Type': 'application/json' },
+					});
+		});
+		const second = captureIO();
+		try {
+			await infraCommand(['release', 'get', 'rel_y']);
+		} finally {
+			second.restore();
+		}
+		expect(retried.map((c) => c.auth)).toEqual([`Bearer ${TOKEN}`, `Bearer ${PLAN_TOKEN}`]);
+	});
+
+	test('a value of the wrong kind in either variable is named, not sent', async () => {
+		process.env.HOSTSTACK_RELEASE_PLAN_TOKEN = TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { cap, restore } = captureIO();
+		try {
+			await infraCommand(['release', 'get', 'rel_x']);
+		} catch {
+			// process.exit is stubbed to throw.
+		} finally {
+			restore();
+		}
+		expect(cap.exitCode).toBe(1);
+		expect(cap.err.join('\n')).toContain('hsrpt_');
+		expect(calls).toHaveLength(0);
+	});
+
+	test("reads an infra machine's project network", async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand(['network', '12458']);
+		} finally {
+			restore();
+		}
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.url).toEndWith('/api/admin/servers/12458/project-network');
+		expect(calls[0]!.method ?? 'GET').toBe('GET');
+		expect(calls[0]!.auth).toBe(`Bearer ${TOKEN}`);
+	});
+
+	test('recreates the project network only when --recreate is given', async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand(['network', '12458', '--recreate']);
+		} finally {
+			restore();
+		}
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.url).toEndWith('/api/admin/servers/12458/project-network/recreate');
+		expect(calls[0]!.method).toBe('POST');
+	});
+
+	test('sends a machine policy exactly as the file holds it', async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		const file = join(tmp, 'policy.json');
+		const policy = { addresses: ['192.0.2.7'], mountRoots: ['/etc/letsencrypt'] };
+		writeFileSync(file, JSON.stringify(policy));
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand(['policy', '4', '--file', file]);
+		} finally {
+			restore();
+		}
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.url).toEndWith('/api/admin/servers/4/infra-policy');
+		expect(calls[0]!.method).toBe('PUT');
+		expect(JSON.parse(calls[0]!.body ?? '{}')).toEqual(policy);
+	});
+
+	test('refuses a short commit SHA before sending anything', async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { cap, restore } = captureIO();
+		try {
+			await infraCommand(['build', '7', '--commit', 'abc123']);
+		} catch {
+			// process.exit is stubbed to throw.
+		} finally {
+			restore();
+		}
+		expect(cap.exitCode).toBe(1);
+		expect(calls).toHaveLength(0);
+	});
+
+	test('takes a service out of releases with a DELETE and no body', async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand(['release-settings', '237', '--remove']);
+		} finally {
+			restore();
+		}
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.url).toEndWith('/api/admin/services/237/release-settings');
+		expect(calls[0]!.method).toBe('DELETE');
+		expect(calls[0]!.body).toBeUndefined();
+	});
+
+	test('plans a release of named services only when --services is given', async () => {
+		process.env.HOSTSTACK_INFRA_OPERATOR_TOKEN = TOKEN;
+		const calls: Call[] = [];
+		infraFetch(calls);
+		const { restore } = captureIO();
+		try {
+			await infraCommand([
+				'release',
+				'plan',
+				'15',
+				'--commit',
+				'b'.repeat(40),
+				'--services',
+				'235, 236',
+			]);
+		} finally {
+			restore();
+		}
+		expect(JSON.parse(calls[0]!.body ?? '{}')).toEqual({
+			commitSha: 'b'.repeat(40),
+			allowFullRollout: false,
+			services: [235, 236],
+		});
+	});
+});
+
+describe('logs', () => {
+	test('--since 10m reaches the API as -10m, and --level/--stream/--search are passed on', async () => {
+		// Both were silently dropped: `10m` is not a form the API parses (it skips
+		// what it cannot read, so no time filter applied), and `--level` was
+		// never read at all, so `--level error` printed info lines too.
+		saveConfig({ apiKey: 'hs_test_x', teamId: 42 });
+		const urls: string[] = [];
+		installFetch((url) => {
+			urls.push(url);
+			return new Response(JSON.stringify({ logs: [] }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		});
+		const { restore } = captureIO();
+		try {
+			await logsCommand([
+				'svc_1',
+				'--since',
+				'10m',
+				'--level',
+				'error',
+				'--stream',
+				'stderr',
+				'--search',
+				'boom',
+			]);
+		} finally {
+			restore();
+		}
+		const q = new URL(urls[0] ?? '').searchParams;
+		expect(q.get('since')).toBe('-10m');
+		expect(q.get('level')).toBe('error');
+		expect(q.get('stream')).toBe('stderr');
+		expect(q.get('search')).toBe('boom');
+	});
+
+	test('normalizeSince accepts the documented and API forms, rejects the rest', () => {
+		expect(normalizeSince('10m')).toBe('-10m');
+		expect(normalizeSince('-1h')).toBe('-1h');
+		expect(normalizeSince('2026-10-03T13:00:00Z')).toBe('2026-10-03T13:00:00Z');
+		expect(normalizeSince('10 minutes')).toBeUndefined();
+		expect(normalizeSince('10')).toBeUndefined();
 	});
 });

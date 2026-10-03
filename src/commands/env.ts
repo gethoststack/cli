@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
 import { bold, dim, green, handleError, red, spinner, table } from '../lib/output.ts';
@@ -61,6 +63,8 @@ export async function envCommand(args: string[]): Promise<void> {
 			return deleteEnvVar(args.slice(1));
 		case 'bulk':
 			return bulkSetEnvVars(args.slice(1));
+		case 'import':
+			return importEnvFile(args.slice(1));
 		default:
 			console.log(`${bold('Usage:')} hoststack env <command> <service-id>`);
 			console.log();
@@ -68,6 +72,9 @@ export async function envCommand(args: string[]): Promise<void> {
 			console.log('  list <service-id>                     List environment variables');
 			console.log('  get <service-id> <KEY>                Get a single variable');
 			console.log('  set <service-id> KEY=VALUE            Create or update a variable');
+			console.log(
+				'  import <service-id> <file> [--apply]  Import a .env file (dry run unless --apply)',
+			);
 			console.log('  delete <service-id> <KEY|env-var-id>  Delete an environment variable');
 			console.log('  bulk <service-id> KEY1=VAL1 KEY2=VAL2 Replace all variables at once');
 			console.log();
@@ -320,4 +327,118 @@ async function bulkSetEnvVars(args: string[]): Promise<void> {
 		s.stop(red('Failed'));
 		handleError(err);
 	}
+}
+
+interface EnvImportResponse {
+	dryRun: boolean;
+	applied: boolean;
+	mode: 'merge' | 'replace';
+	refusals: Array<{ line: number; reason: string }>;
+	warnings: Array<{ key: string; reason: string }>;
+	plan: Array<{ key: string; action: 'add' | 'change' | 'unchanged' | 'remove' }>;
+	roundTrip?: { verified: number; mismatched: string[] };
+}
+
+/**
+ * `hoststack env import <service-id> <file> [--apply] [--replace] [--target t] [--no-secret]`
+ *
+ * The file is sent as text and read by the server, strictly: a line whose
+ * meaning depends on the reader (an unquoted bcrypt `$`, an unquoted ` #`) is
+ * refused with its line number instead of guessed at. Nothing is written
+ * without `--apply`. Output names keys and counts, never a value — this is
+ * usually a production secrets file in a terminal that is being recorded.
+ */
+async function importEnvFile(args: string[]): Promise<void> {
+	const teamId = getTeamId();
+	if (!teamId) {
+		console.error(red('No team selected. Run: hoststack login --key <api-key>'));
+		process.exit(1);
+	}
+	const flagValue = getFlagValue(args, '--target');
+	const [serviceId, filePath] = args.filter((a) => !a.startsWith('-') && a !== flagValue);
+	if (!serviceId || !filePath) {
+		console.log(
+			`${bold('Usage:')} hoststack env import <service-id> <file> [--apply] [--replace] [--target <t>] [--no-secret]`,
+		);
+		console.log(
+			dim('Without --apply nothing is written: the plan and any refused lines are printed.'),
+		);
+		process.exit(1);
+	}
+	const apply = args.includes('--apply');
+	const mode = args.includes('--replace') ? 'replace' : 'merge';
+	const target = parseTargetFlag(args) ?? 'runtime';
+	const isSecret = parseSecretFlag(args) ?? true;
+
+	let bytes: Buffer;
+	try {
+		// node:fs, not Bun.file: this bundle runs on node (node-runtime.test.ts).
+		bytes = readFileSync(filePath);
+	} catch {
+		console.error(`${red('Error:')} Could not read ${filePath}`);
+		process.exit(1);
+	}
+	let content: string;
+	try {
+		// Fatal: a non-UTF-8 byte would otherwise become U+FFFD and be imported
+		// as a changed value. The BOM is kept so the server refuses it by line.
+		content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+	} catch {
+		console.error(
+			`${red('Error:')} ${filePath} is not valid UTF-8, so its values cannot be imported byte for byte. Convert it to UTF-8 first. Nothing was sent.`,
+		);
+		process.exit(1);
+	}
+
+	const s = spinner(apply ? 'Importing...' : 'Checking...');
+	let result: EnvImportResponse;
+	try {
+		result = await apiFetch<EnvImportResponse>(
+			`/api/services/${teamId}/${serviceId}/env/import`,
+			{
+				method: 'POST',
+				body: JSON.stringify({ content, dryRun: !apply, mode, target, isSecret }),
+			},
+		);
+	} catch (err) {
+		s.stop(red('Failed'));
+		handleError(err);
+		return;
+	}
+	s.stop(result.applied ? green('Imported') : 'Checked');
+
+	for (const r of result.refusals) console.log(`${red('refused')} line ${r.line}: ${r.reason}`);
+	for (const w of result.warnings) console.log(`${dim('note')} ${w.key}: ${w.reason}`);
+	for (const p of result.plan) {
+		if (p.action === 'unchanged') continue;
+		console.log(`  ${p.action === 'remove' ? red('-') : green('+')} ${p.key} ${dim(p.action)}`);
+	}
+	const count = (action: string) => result.plan.filter((p) => p.action === action).length;
+	console.log(
+		`${count('add')} to add, ${count('change')} to change, ${count('unchanged')} unchanged${
+			mode === 'replace' ? `, ${count('remove')} to remove` : ''
+		}.`,
+	);
+
+	if (result.refusals.length > 0) {
+		console.error(
+			red(
+				`${result.refusals.length} line(s) cannot be imported as written. Nothing was changed.`,
+			),
+		);
+		process.exit(1);
+	}
+	if (!result.roundTrip) {
+		console.log(dim('Dry run. Re-run with --apply to write.'));
+		return;
+	}
+	const { verified, mismatched } = result.roundTrip;
+	if (mismatched.length > 0) {
+		console.error(red(`Round trip FAILED for: ${mismatched.join(', ')}`));
+		process.exit(1);
+	}
+	console.log(
+		green(`Round trip: all ${verified} value(s) read back from storage byte for byte.`),
+	);
+	console.log(dim('Platform variables and ${{…}} templates are added at deploy.'));
 }

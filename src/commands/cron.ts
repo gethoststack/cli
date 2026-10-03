@@ -1,5 +1,6 @@
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
+import { formatDateTime } from '../lib/format.ts';
 import { bold, dim, green, handleError, red, spinner, statusBadge, table } from '../lib/output.ts';
 
 interface CronExecution {
@@ -83,8 +84,8 @@ async function listExecutions(args: string[]): Promise<void> {
 					e.exitCode !== null && e.exitCode !== undefined
 						? String(e.exitCode)
 						: dim('n/a'),
-					e.startedAt ? new Date(e.startedAt).toLocaleString() : dim('n/a'),
-					e.finishedAt ? new Date(e.finishedAt).toLocaleString() : dim('n/a'),
+					e.startedAt ? formatDateTime(e.startedAt) : dim('n/a'),
+					e.finishedAt ? formatDateTime(e.finishedAt) : dim('n/a'),
 				]),
 			),
 		);
@@ -129,12 +130,12 @@ async function getExecution(args: string[]): Promise<void> {
 			console.log(`${bold('Triggered:')}   ${e.triggeredBy}`);
 		}
 		console.log(
-			`${bold('Started:')}     ${e.startedAt ? new Date(e.startedAt).toLocaleString() : dim('n/a')}`,
+			`${bold('Started:')}     ${e.startedAt ? formatDateTime(e.startedAt) : dim('n/a')}`,
 		);
 		console.log(
-			`${bold('Finished:')}    ${e.finishedAt ? new Date(e.finishedAt).toLocaleString() : dim('n/a')}`,
+			`${bold('Finished:')}    ${e.finishedAt ? formatDateTime(e.finishedAt) : dim('n/a')}`,
 		);
-		console.log(`${bold('Created:')}     ${new Date(e.createdAt).toLocaleString()}`);
+		console.log(`${bold('Created:')}     ${formatDateTime(e.createdAt)}`);
 	} catch (err) {
 		handleError(err);
 	}

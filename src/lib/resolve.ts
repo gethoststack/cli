@@ -57,3 +57,31 @@ export async function resolveServiceId(teamId: number, input: string): Promise<n
 	);
 	process.exit(1);
 }
+
+/**
+ * Resolve an environment id from either a numeric id or an `env_…` publicId.
+ *
+ * The promote route takes a NUMERIC target environment, which is not what
+ * `hoststack environments list` prints — it prints the publicId. Without this
+ * the flag would only accept the one form nobody has in front of them.
+ */
+export async function resolveEnvironmentId(teamId: number, input: string): Promise<number> {
+	if (/^\d+$/.test(input)) return Number(input);
+	if (input.startsWith('env_')) {
+		try {
+			return await getClient().resolveId(input, { kind: 'environment', teamId });
+		} catch (err: unknown) {
+			if (err instanceof NotFoundError) {
+				console.error(red(`Environment "${input}" not found in this team.`));
+				process.exit(1);
+			}
+			throw err;
+		}
+	}
+	console.error(
+		red(
+			`Invalid environment id "${input}". Expected a numeric id or a publicId starting with "env_".`,
+		),
+	);
+	process.exit(1);
+}

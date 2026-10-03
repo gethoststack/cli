@@ -1,5 +1,6 @@
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
+import { formatDate } from '../lib/format.ts';
 import { bold, dim, green, handleError, red, spinner, table } from '../lib/output.ts';
 
 interface Project {
@@ -61,12 +62,7 @@ async function listProjects(args: string[]): Promise<void> {
 		console.log(
 			table(
 				['ID', 'Name', 'Region', 'Created'],
-				projects.map((p) => [
-					p.publicId,
-					p.name,
-					p.region,
-					new Date(p.createdAt).toLocaleDateString(),
-				]),
+				projects.map((p) => [p.publicId, p.name, p.region, formatDate(p.createdAt)]),
 			),
 		);
 	} catch (err) {

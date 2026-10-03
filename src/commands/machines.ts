@@ -1,5 +1,6 @@
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
+import { formatDateTime } from '../lib/format.ts';
 import { bold, cyan, dim, handleError, red, spinner, table, yellow } from '../lib/output.ts';
 
 /**
@@ -12,6 +13,11 @@ interface Machine {
 	hostname: string;
 	name: string;
 	status: string;
+	/** `infra` = first-party infrastructure bound to one project: listed and
+	 *  pinnable by that project's services, but re-paired and removed only by a
+	 *  HostStack operator. */
+	kind: 'byo' | 'infra';
+	infraProjectId: number | null;
 	enrolled: boolean;
 	totalMemoryMb: number | null;
 	totalCpuCores: number | null;
@@ -145,7 +151,7 @@ async function listMachines(args: string[]): Promise<void> {
 				['ID', 'Name', 'State', 'Running', 'Memory', 'CPU'],
 				machines.map((m) => [
 					String(m.id),
-					m.name,
+					m.kind === 'infra' ? `${m.name} ${dim('[infra]')}` : m.name,
 					machineState(m),
 					describeWorkloads(m.workloads),
 					m.totalMemoryMb === null
@@ -229,7 +235,7 @@ async function showMachine(args: string[]): Promise<void> {
 					m.targetAgentVersion && m.agentVersion !== m.targetAgentVersion
 						? ` (we ship ${m.targetAgentVersion})`
 						: ''
-				}${m.lastHeartbeatAt ? ` · last heard from ${new Date(m.lastHeartbeatAt).toLocaleString()}` : ''}`,
+				}${m.lastHeartbeatAt ? ` · last heard from ${formatDateTime(m.lastHeartbeatAt)}` : ''}`,
 			),
 		);
 		console.log();
@@ -292,7 +298,7 @@ async function addMachine(args: string[]): Promise<void> {
 		// later" and coming back to a command that silently fails.
 		console.log(
 			dim(
-				`The command carries a single-use pairing token that expires ${new Date(pairing.expiresAt).toLocaleString()}. Generate a fresh one from the dashboard if it does.`,
+				`The command carries a single-use pairing token that expires ${formatDateTime(pairing.expiresAt)}. Generate a fresh one from the dashboard if it does.`,
 			),
 		);
 		console.log(
@@ -330,6 +336,15 @@ async function removeMachine(args: string[]): Promise<void> {
 
 	try {
 		const machine = await resolveMachine(teamId, target);
+		// The API refuses this too; saying so here spares a spinner and a 403.
+		if (machine.kind === 'infra') {
+			console.error(
+				red(
+					`"${machine.name}" is an infrastructure machine. It is managed by a HostStack operator and can't be removed from the CLI.`,
+				),
+			);
+			process.exit(1);
+		}
 		const s = spinner(`Removing "${machine.name}"...`);
 		try {
 			await apiFetch(`/api/machines/${teamId}/${machine.id}`, { method: 'DELETE' });

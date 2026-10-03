@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+import { text as readStream } from 'node:stream/consumers';
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
 import { bold, cyan, dim, green, handleError, red, statusBadge, table } from '../lib/output.ts';
@@ -206,10 +208,24 @@ async function addTask(args: string[]): Promise<void> {
 	const bodyFile = flag(args, '--body-file');
 	if (bodyFile) {
 		// `-` means stdin, so a long brief can be piped instead of shell-quoted.
-		body =
-			bodyFile === '-'
-				? await new Response(Bun.stdin.stream()).text()
-				: await Bun.file(bodyFile).text();
+		//
+		// Node APIs, not `Bun.file` / `Bun.stdin`: this bundle is built for node18
+		// and ships to npm with a `#!/usr/bin/env node` banner, so a Bun global here
+		// is a `ReferenceError: Bun is not defined` for every user who installs the
+		// CLI the documented way. `node:stream/consumers` takes a Node Readable back
+		// to 16.7 — `new Response(process.stdin)` only started accepting one in
+		// later undici — and both of these behave identically under Bun.
+		//
+		// Wrapped because this read sits OUTSIDE the try/catch below: a mistyped
+		// path used to exit on a raw `ENOENT` stack trace out of node:internal.
+		try {
+			body =
+				bodyFile === '-'
+					? await readStream(process.stdin)
+					: await readFile(bodyFile, 'utf8');
+		} catch (err) {
+			handleError(err);
+		}
 	}
 
 	try {

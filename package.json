@@ -1,6 +1,6 @@
 {
 	"name": "@hoststack.dev/cli",
-	"version": "0.14.0",
+	"version": "0.24.0",
 	"description": "Official command-line interface for HostStack — deploy and manage web services, databases, cron jobs, and domains on European infrastructure. See https://hoststack.dev",
 	"keywords": [
 		"hoststack",
@@ -46,7 +46,7 @@
 		"typecheck": "tsc --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc.tsbuildinfo"
 	},
 	"dependencies": {
-		"@hoststack.dev/sdk": "^0.16.0"
+		"@hoststack.dev/sdk": "^0.22.0"
 	},
 	"devDependencies": {
 		"@types/bun": "^1.3.14",

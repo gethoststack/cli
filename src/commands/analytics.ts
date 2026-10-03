@@ -1,5 +1,6 @@
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
+import { formatCount } from '../lib/format.ts';
 import { bold, cyan, dim, green, handleError, red, table, yellow } from '../lib/output.ts';
 
 interface AnalyticsSite {
@@ -35,6 +36,7 @@ interface SiteStatus {
 	lastRefusalReason: RefusalReason | null;
 	lastRefusalOrigin: string | null;
 	refusedRecently: Record<RefusalReason, number>;
+	refusedOrigins: Record<string, number>;
 	droppedCount: number;
 	quota: { usedThisHour: number; limitPerHour: number; hourResetsAt: string };
 	health: 'receiving' | 'quiet' | 'refusing' | 'never';
@@ -86,6 +88,8 @@ export async function analyticsCommand(args: string[]): Promise<void> {
 			return listSites(args.slice(1));
 		case 'add':
 			return addSite(args.slice(1));
+		case 'set':
+			return setSite(args.slice(1));
 		case 'rm':
 			return removeSite(args.slice(1));
 		case 'rotate':
@@ -104,6 +108,9 @@ export async function analyticsCommand(args: string[]): Promise<void> {
 			console.log('Commands:');
 			console.log('  sites [--json]                     Every site this team tracks');
 			console.log('  add <domain> [--name <name>]       Start tracking a domain');
+			console.log(
+				'  set <domain> [--allowed-origins a,b] [--name <name>] [--retention <days>]',
+			);
 			console.log('  rm <domain>                        Delete a site and its data');
 			console.log('  rotate <domain>                    New key; the old one lasts 30 days');
 			console.log(
@@ -209,7 +216,7 @@ async function listSites(args: string[]): Promise<void> {
 		for (const s of data.sites.filter((site) => blockingRefusals(site.refusedRecently) > 0)) {
 			console.log(
 				yellow(
-					`${s.domain}: ${blockingRefusals(s.refusedRecently).toLocaleString()} events were refused in the last 7 days (${s.lastRefusalReason ?? 'unknown'}). Run: hoststack analytics check ${s.domain}`,
+					`${s.domain}: ${formatCount(blockingRefusals(s.refusedRecently))} events were refused in the last 7 days (${s.lastRefusalReason ?? 'unknown'}). Run: hoststack analytics check ${s.domain}`,
 				),
 			);
 		}
@@ -217,7 +224,7 @@ async function listSites(args: string[]): Promise<void> {
 		for (const s of dropping) {
 			console.log(
 				yellow(
-					`${s.domain}: ${s.droppedCount.toLocaleString()} events were refused by the hourly quota and are missing from its counts.`,
+					`${s.domain}: ${formatCount(s.droppedCount)} events were refused by the hourly quota and are missing from its counts.`,
 				),
 			);
 		}
@@ -277,10 +284,28 @@ async function checkSite(args: string[]): Promise<void> {
 		}
 		const refused = Object.entries(status.refusedRecently)
 			.filter(([, count]) => count > 0)
-			.map(([reason, count]) => `${reason} ${count.toLocaleString()}`);
+			.map(([reason, count]) => `${reason} ${formatCount(count)}`);
 		console.log(`${dim('Refused 7d ')} ${refused.length > 0 ? refused.join(' · ') : 'none'}`);
+		// The origins behind the bad_origin refusals, which is the only part of
+		// the tally there is an action for. `Last refusal` above names the
+		// newest refusal of ANY reason, so it is usually a bot's origin.
+		const badOrigins = Object.entries(status.refusedOrigins ?? {}).sort((a, b) => b[1] - a[1]);
+		if (badOrigins.length > 0) {
+			console.log(
+				`${dim('Refused by origin')} ${badOrigins
+					.map(([origin, count]) => `${origin} ${formatCount(count)}`)
+					.join(' · ')}`,
+			);
+			console.log(
+				cyan(
+					`  If yours: hoststack analytics set ${status.domain} --allowed-origins ${badOrigins
+						.map(([origin]) => origin)
+						.join(',')}`,
+				),
+			);
+		}
 		console.log(
-			`${dim('Quota      ')} ${status.quota.usedThisHour.toLocaleString()} / ${status.quota.limitPerHour.toLocaleString()} this hour`,
+			`${dim('Quota      ')} ${formatCount(status.quota.usedThisHour)} / ${formatCount(status.quota.limitPerHour)} this hour`,
 		);
 		if (status.health === 'never') {
 			console.log();
@@ -311,6 +336,70 @@ async function addSite(args: string[]): Promise<void> {
 		console.log(green(`Tracking ${site.domain}.`));
 		console.log();
 		printSnippet(site);
+	} catch (error) {
+		handleError(error);
+	}
+}
+
+/**
+ * Change a site after creation — most often its allowed origins.
+ *
+ * `check` reports `bad_origin` refusals and names the origin that was turned
+ * away, but until this existed there was no way to act on that answer outside
+ * the dashboard: the API and SDK both took `allowedOrigins`, and neither the
+ * CLI nor MCP offered it.
+ *
+ * `--allowed-origins` REPLACES the list, so print the current one and say so
+ * rather than letting a one-item flag silently discard the rest.
+ */
+async function setSite(args: string[]): Promise<void> {
+	const teamId = requireTeam();
+	const domain = args[0];
+	if (!domain) {
+		console.error(
+			red(
+				'Usage: hoststack analytics set <domain> [--allowed-origins a,b] [--name <name>] [--retention <days>]',
+			),
+		);
+		process.exit(1);
+	}
+
+	const originsRaw = flag(args, '--allowed-origins');
+	const name = flag(args, '--name');
+	const retentionRaw = flag(args, '--retention');
+
+	const patch: Record<string, unknown> = {};
+	if (originsRaw !== undefined) {
+		// `--allowed-origins ""` is how you clear the list.
+		patch['allowedOrigins'] = originsRaw
+			.split(',')
+			.map((o) => o.trim())
+			.filter((o) => o.length > 0);
+	}
+	if (name !== undefined) patch['name'] = name;
+	if (retentionRaw !== undefined) {
+		const days = Number.parseInt(retentionRaw, 10);
+		if (Number.isNaN(days) || days < 1) {
+			console.error(red('--retention takes a whole number of days.'));
+			process.exit(1);
+		}
+		patch['retentionDays'] = days;
+	}
+	if (Object.keys(patch).length === 0) {
+		console.error(red('Nothing to change. Pass --allowed-origins, --name or --retention.'));
+		process.exit(1);
+	}
+
+	try {
+		const site = await resolveSite(teamId, domain);
+		const updated = await apiFetch<AnalyticsSite>(`/api/analytics/${teamId}/sites/${site.id}`, {
+			method: 'PATCH',
+			body: JSON.stringify(patch),
+		});
+		console.log(green(`Updated ${updated.domain}.`));
+		console.log(
+			`${dim('Origins    ')} ${[updated.domain, `*.${updated.domain}`, ...updated.allowedOrigins].join(', ')}`,
+		);
 	} catch (error) {
 		handleError(error);
 	}
@@ -406,8 +495,8 @@ async function stats(args: string[]): Promise<void> {
 				],
 				[
 					[
-						`${current.visitors.toLocaleString()} ${delta(current.visitors, previous.visitors)}`,
-						`${current.pageviews.toLocaleString()} ${delta(current.pageviews, previous.pageviews)}`,
+						`${formatCount(current.visitors)} ${delta(current.visitors, previous.visitors)}`,
+						`${formatCount(current.pageviews)} ${delta(current.pageviews, previous.pageviews)}`,
 						pct(current.bounceRate),
 						duration(current.avgDurationMs),
 					],
@@ -470,8 +559,8 @@ async function allSitesTable(teamId: number, range: string, json: boolean): Prom
 			['Site', summed ? 'Daily visitors' : 'Visitors', 'Pageviews', 'Bounce', 'Live'],
 			data.sites.map((s) => [
 				s.domain,
-				`${s.current.visitors.toLocaleString()} ${delta(s.current.visitors, s.previous.visitors)}`,
-				`${s.current.pageviews.toLocaleString()} ${delta(s.current.pageviews, s.previous.pageviews)}`,
+				`${formatCount(s.current.visitors)} ${delta(s.current.visitors, s.previous.visitors)}`,
+				`${formatCount(s.current.pageviews)} ${delta(s.current.pageviews, s.previous.pageviews)}`,
 				pct(s.current.bounceRate),
 				s.live > 0 ? green(String(s.live)) : dim('—'),
 			]),

@@ -1,5 +1,6 @@
 import { apiFetch } from '../lib/api.ts';
 import { getTeamId } from '../lib/config.ts';
+import { formatDateTime } from '../lib/format.ts';
 import { bold, dim, green, handleError, red, table, yellow } from '../lib/output.ts';
 
 interface UptimeCheck {
@@ -158,7 +159,7 @@ async function getCheck(args: string[]): Promise<void> {
 		);
 		if (check.lastError) console.log(`${bold('Detail')}  ${check.lastError}`);
 		if (check.status === 'down' && check.lastChangedAt) {
-			console.log(`${bold('Since')}   ${new Date(check.lastChangedAt).toLocaleString()}`);
+			console.log(`${bold('Since')}   ${formatDateTime(check.lastChangedAt)}`);
 		}
 		console.log();
 		console.log(
@@ -181,7 +182,7 @@ async function getCheck(args: string[]): Promise<void> {
 			console.log();
 			console.log(
 				dim(
-					`Last checked ${new Date(check.lastCheckedAt).toLocaleString()}${
+					`Last checked ${formatDateTime(check.lastCheckedAt)}${
 						check.lastStatusCode !== null
 							? ` — HTTP ${check.lastStatusCode} in ${check.lastLatencyMs ?? 0}ms`
 							: ''
@@ -226,12 +227,16 @@ async function setCheck(args: string[]): Promise<void> {
 				`Uptime check saved: ${check.method} ${check.path} every ${check.intervalSeconds}s, expecting HTTP ${check.expectedStatus}.`,
 			),
 		);
-		// Worth stating plainly: an edit resets accumulated state, so the
-		// status going back to "unknown" is the intended behaviour and not the
-		// check having broken.
+		// Worth stating plainly: a CHANGED check resets its accumulated state, so
+		// the status going back to "unknown" is the intended behaviour and not the
+		// check having broken. Say which of the two happened, though — a write that
+		// changed nothing resets nothing, and a line claiming otherwise is what
+		// teaches people to read an intact check as a wiped one.
 		console.log(
 			dim(
-				'Editing a check resets its recorded state — it has not observed the new check failing yet, so it starts from unknown.',
+				check.lastCheckedAt === null
+					? 'A changed check starts from unknown — it has not observed the new shape failing yet. Read it back with `hoststack uptime get` rather than saving it again.'
+					: `Nothing changed, so nothing was reset: still ${check.status}, last probed ${formatDateTime(check.lastCheckedAt)}.`,
 			),
 		);
 	} catch (err) {
